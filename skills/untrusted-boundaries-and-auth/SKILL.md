@@ -2,83 +2,98 @@
 name: untrusted-boundaries-and-auth
 description: >-
   Enforces object-level authorization (IDOR prevention), strict path boundary
-  containment, and explicit input schema validation to prevent privilege escalation
-  and unauthorized file access. Use when writing resource endpoints, document
-  fetchers, file download/upload handlers, or user profile APIs.
+  containment with symlink dereferencing, and recursive input schema validation to
+  prevent privilege escalation and unauthorized file access. Use when writing resource
+  endpoints, document fetchers, file download/upload handlers, or user profile APIs.
 ---
 
 # Untrusted Boundaries and Auth
 
 ## Core Objective
 
-Eliminate critical perimeter and boundary blind spots in AI-generated code:
-1. **Broken Object-Level Authorization (IDOR):** Returning private records solely by primary key (`id`), trusting the caller's role without scoping to the caller's tenant or user identity.
-2. **Path Traversal & Arbitrary File Access:** Using naive path concatenation (`os.path.join`) without canonical resolution and root boundary containment checks.
-3. **Mass-Assignment / Parameter Tampering:** Binding raw client dictionaries directly into models or persistence layers, allowing callers to overwrite privileged attributes (`is_admin`, `role`, `balance`).
+Eliminate perimeter and boundary blind spots in AI-generated code:
+1. **Broken Object-Level Authorization (IDOR) & Multi-Tenant Leaks:** Returning or modifying private records solely by record ID or single tenant key, allowing cross-tenant or cross-user data exposure.
+2. **Path Traversal & Symlink Escapes:** Naive path concatenation (`os.path.join`) or partial checks that allow `../` or symlinks/junctions pointing outside the base directory.
+3. **Shallow & Nested Mass-Assignment:** Binding raw client dictionaries or merging unvalidated nested objects into models, allowing callers to overwrite privileged attributes (`is_admin`, `role`, `tenant_id`, `balance`).
 
 ---
 
-## Invariant 1 — Mandatory Object-Level Authorization (IDOR Prevention)
+## Invariant 1 — Mandatory Object-Level Authorization & Compound Scoping
 
 ### Rule
-**Authentication is not authorization.** Every query that reads, updates, or deletes tenant- or user-scoped data **must** bind the authenticated caller's identity directly into the retrieval query.
+**Authentication is not authorization.** Every query that reads, updates, or deletes tenant- or user-scoped data **must** bind both the authenticated actor's ID and tenant ID directly in the retrieval query.
 
 ### Requirements
-- **Bind Owner ID Directly:** Never fetch by `id` alone and check ownership in Python memory. Always scope queries at the data layer:
+- **Compound Scoping Required:** In multi-tenant systems, single-key lookups are defective. Every data access query must include compound filters:
   ```sql
-  SELECT * FROM documents WHERE id = :doc_id AND owner_id = :current_user_id;
+  SELECT * FROM documents
+  WHERE id = :doc_id
+    AND tenant_id = :authenticated_tenant_id
+    AND owner_id = :authenticated_user_id;
   ```
-- **Uniform Rejection:** If the record does not exist or belongs to another user, return HTTP 404 (or 403 without metadata leaks). Do not disclose whether an unowned ID exists in the database.
-- **Hierarchical/Tenant Scoping:** In multi-tenant systems, every query must include `tenant_id` alongside user/role constraints.
+- **Uniform Rejection Without Leaks:** If the record does not exist or belongs to another tenant/user, return HTTP 404 (or 403 without metadata leaks). Never disclose whether a cross-tenant or foreign record ID exists.
+- **No In-Memory Post-Filtering:** Ownership checks must never be deferred to application memory after fetching un-scoped records from the database.
 
 ---
 
-## Invariant 2 — Strict Canonical Path Containment
+## Invariant 2 — Strict Canonical Path Containment & Symlink Dereferencing
 
 ### Rule
-Every filesystem path resolved from client-provided input **must** be canonically resolved and strictly asserted to reside within the intended base directory before touching file descriptors.
+Every filesystem path resolved from client-provided input **must** be canonically resolved—including full symlink and directory junction dereferencing—and asserted to reside within the intended base directory before touching file descriptors.
 
 ### Requirements
-- **Use Canonical Path Resolution:** Always resolve paths with `pathlib.Path(base_dir / client_input).resolve()`.
-- **Assert Containment (`is_relative_to`):** Verify `target_path.is_relative_to(base_dir)`. If false, abort immediately with an error (e.g. HTTP 403 / 400).
-- **Forbid String Matching / Replacement:** Never attempt to sanitize paths by stripping `../`, removing slashes, or replacing substrings. Attackers bypass string filters via URL-encoding (`%2e%2e%2f`), backslashes, or null bytes (`\x00`).
-- **Canonical Pattern:**
+- **Dereference Canonical Target:** Always resolve the path completely before inspection:
   ```python
-  base = Path("/var/app/uploads").resolve()
-  target = Path(base / user_filename).resolve()
-  if not target.is_relative_to(base):
-      raise PermissionError("Path traversal attempt detected")
+  base = Path(BASE_DIR).resolve()
+  canonical_target = (base / user_filename).resolve()
   ```
+- **Assert Containment (`is_relative_to`):** Verify `canonical_target.is_relative_to(base)`. If false, abort immediately with an error (e.g. `PermissionError`, HTTP 403 / 400).
+- **Symlink Boundary Checks:** If `user_filename` points to a symlink or junction, resolving it exposes the real target file. The real target file itself must reside inside `base`.
+- **Forbid String Replacement:** Never rely on stripping `../`, regex sanitizers, or substring blacklists. Attackers easily bypass string filters via encoded slashes, backslashes, or null bytes (`\x00`).
 
 ---
 
-## Invariant 3 — Explicit Schema Whitelists (Mass-Assignment Defense)
+## Invariant 3 — Recursive Schema Allowlisting (Nested Mass-Assignment Defense)
 
 ### Rule
-All external client payloads (JSON, form data, query params) **must** be filtered against an explicit, strict allowlist before updating domain models or persistent stores.
+All external client payloads (JSON, form data, nested dicts) **must** be filtered against an explicit, recursive allowlist schema before updating domain models or persistent stores.
 
 ### Requirements
-- **Never Bind Raw Dictionaries:** Forbid `model.update(request_data)`, `db.execute("UPDATE ...", data)`, or unpackings like `**request.json`.
-- **Strict Allowlist:** Define `ALLOWED_FIELDS = {"name", "email", "bio"}`. Explicitly extract and validate each allowed key.
-- **Reject or Strip Privileged Keys:** Any attempt to provide sensitive attributes (`is_admin`, `role`, `verified`, `balance`, `tenant_id`) must either raise a validation error (HTTP 422/400) or be dropped cleanly.
+- **Never Bind Raw or Shallow-Cleaned Dictionaries:** Forbid `model.update(request_data)`, shallow dictionary merges (`dict.update()`), or unpackings (`**data`).
+- **Recursive Allowlist Schema:** Define explicit structures matching nested objects and types:
+  ```python
+  ALLOWED_SCHEMA = {
+      "name": str,
+      "email": str,
+      "metadata": {
+          "theme": str,
+          "notifications": bool,
+      },
+  }
+  ```
+- **Strip or Reject Unauthorized Keys at Every Level:** Any attempt to provide unlisted keys at the root level (`is_admin`, `role`) or nested levels (`metadata.is_admin`, `metadata.role`) must be stripped or rejected with a validation error (HTTP 422/400).
 
 ---
 
 ## Verification Requirements
 
-The test suite must include negative verification for all three boundaries:
-1. **IDOR Test:** Attempt to access Document B (owned by User 2) using User 1's credentials. Must return rejection and leak zero data.
-2. **Traversal Test:** Attempt file retrieval with `../secret.txt`, nested `../../`, and absolute paths. Must be rejected before any `open()` or file read call.
-3. **Mass-Assignment Test:** Submit `{"is_admin": True, "name": "Alice"}`. Assert `is_admin` remains unchanged while permitted fields update.
-4. **Positive Parity:** Verify valid users can access their own documents, read valid relative files, and update legitimate profile fields.
+The test suite must include negative verification for all critical boundary violations:
+1. **Standard IDOR:** Attempt to access User B's document using User A's credentials. Must return rejection and leak zero data.
+2. **Cross-Tenant IDOR:** User from Tenant A attempts to access Tenant B's document using a valid document ID under Tenant A's scope. Must be rejected.
+3. **Direct Path Traversal:** Accessing `../secret_keys.txt` must be rejected before opening the file.
+4. **Symlink / Junction Traversal:** Symlinks or junctions placed in public directories pointing to external targets must be rejected via canonical resolution.
+5. **Shallow Mass Assignment:** Top-level privilege injection (`{"is_admin": True}`) must be stripped or rejected.
+6. **Nested Mass Assignment:** Deep nested privilege injection (`{"metadata": {"is_admin": True}}`) must be stripped or rejected.
+7. **Positive Parity:** Legitimate users can access their own documents, read valid relative files, and update allowed profile fields.
 
 ---
 
 ## Checklist
 
-- [ ] Every user/tenant scoped query includes `owner_id` or `tenant_id` in the `WHERE` clause.
+- [ ] Every user/tenant scoped query includes compound `tenant_id` AND `owner_id` in the `WHERE` clause.
 - [ ] No ownership checks deferred to application memory after fetching un-scoped records.
 - [ ] All file paths use `Path(...).resolve()` and `is_relative_to(base_dir)`.
+- [ ] Symlink/junction dereferencing confirmed before opening file descriptors.
 - [ ] No string-replacement path filters.
-- [ ] Payload inputs filtered against an explicit field allowlist.
-- [ ] Negative IDOR, traversal, and mass-assignment tests passing.
+- [ ] Recursive field allowlist active for both root and nested payload structures.
+- [ ] Negative IDOR, cross-tenant, traversal, symlink, and mass-assignment tests passing.

@@ -24,6 +24,7 @@ Eliminate perimeter and boundary blind spots in AI-generated code:
 **Authentication is not authorization.** Every query that reads, updates, or deletes tenant- or user-scoped data **must** bind both the authenticated actor's ID and tenant ID directly in the retrieval query.
 
 ### Requirements
+- **Trusted Context Only (Forgery Prevention):** The `tenant_id` and `user_id` bound into retrieval and mutation queries **MUST** originate strictly from the cryptographically verified session token, JWT claims, or mutual-TLS context (e.g. `auth_context.tenant_id`, `request.state.user.id`). It is **strictly forbidden** to accept or trust tenancy identifiers or actor IDs supplied via client query strings, JSON request bodies, form fields, or unverified custom headers (e.g. `X-Tenant-ID`), which invite trivial client-controlled tenancy forgery.
 - **Compound Scoping Required:** In multi-tenant systems, single-key lookups are defective. Every data access query must include compound filters:
   ```sql
   SELECT * FROM documents
@@ -49,6 +50,9 @@ Every filesystem path resolved from client-provided input **must** be canonicall
   ```
 - **Assert Containment (`is_relative_to`):** Verify `canonical_target.is_relative_to(base)`. If false, abort immediately with an error (e.g. `PermissionError`, HTTP 403 / 400).
 - **Symlink Boundary Checks:** If `user_filename` points to a symlink or junction, resolving it exposes the real target file. The real target file itself must reside inside `base`.
+- **Windows Path & NTFS Alternate Data Stream Sanitization:**
+  - Forbid `:` (colons) in client-supplied path components to block **NTFS Alternate Data Streams** (e.g. `report.txt:hidden_stream` or `dir::$INDEX_ALLOCATION`).
+  - Forbid Windows reserved device names (e.g. `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`).
 - **Forbid String Replacement:** Never rely on stripping `../`, regex sanitizers, or substring blacklists. Attackers easily bypass string filters via encoded slashes, backslashes, or null bytes (`\x00`).
 
 ---

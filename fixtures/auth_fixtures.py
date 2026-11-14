@@ -162,6 +162,10 @@ class HardenedAuthService:
         if "\x00" in filename:
             raise ValueError("Null bytes in path prohibited")
 
+        # Invariant 2: Block NTFS Alternate Data Streams and colons
+        if ":" in filename:
+            raise ValueError("Colons and NTFS alternate data streams prohibited in filename")
+
         # Fully resolve symlinks, junctions, and relative parent references
         canonical_target = raw_path.resolve()
 

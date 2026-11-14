@@ -164,7 +164,23 @@ def test_nested_mass_assignment_rejected():
 
 
 # ---------------------------------------------------------------------------
-# Test 7: Positive Parity Test
+# Test 7: Windows NTFS Alternate Data Stream Block
+# ---------------------------------------------------------------------------
+def test_ntfs_alternate_stream_rejected():
+    """
+    Negative Test 7 (NTFS Alternate Data Stream):
+    Attempts to read via alternate stream notation ('report.txt:stream' or 'doc.txt:hidden').
+    Must raise ValueError / PermissionError, rejecting colon usage before filesystem lookup.
+    """
+    service = get_service()
+    stream_path = "report.txt:hidden_stream"
+
+    with pytest.raises((ValueError, PermissionError)):
+        service.read_file(stream_path)
+
+
+# ---------------------------------------------------------------------------
+# Test 8: Positive Parity Test
 # ---------------------------------------------------------------------------
 def test_authorized_access_succeeds():
     """

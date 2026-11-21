@@ -5,9 +5,10 @@ Verifies physical SQLite state and OS-level boundary enforcement via
 live loopback TCP sockets and raw HTTP wire bytes using http.client.HTTPConnection.
 Every negative test asserts both HTTP status AND database state integrity.
 Services are initialized using create_isolated_db() and hosted on an ephemeral
-kernel-allocated port per test session.
+kernel-allocated port per test session. Identity context is strictly bound to
+cryptographically signed HMAC-SHA256 bearer tokens.
 
-Tests (10 total):
+Tests (13 total):
   1. test_cross_tenant_idor_mutation_blocked
   2. test_sql_mutation_rowcount_integrity
   3. test_windows_device_names_blocked (parametrized: CON, NUL.txt, aux.dat -> 3 tests)
@@ -16,8 +17,12 @@ Tests (10 total):
   6. test_positive_authorized_update
   7. test_http_parameter_pollution_rejection
   8. test_header_identity_spoofing_ignored
+  9. test_wire_tampered_payload_rejected_401
+  10. test_wire_invalid_signature_rejected_401
+  11. test_wire_missing_or_unsigned_authorization_header_rejected_401
 """
 
+import base64
 import http.client
 import json
 import os
@@ -33,9 +38,16 @@ if str(REPO_ROOT) not in sys.path:
 from fixtures.auth_fixtures import (
     create_isolated_db,
     create_auth_server,
+    create_token,
     VulnerableDocumentService,
     HardenedDocumentService,
 )
+
+TOKEN_USER_A = create_token({"tenant_id": "tenant_1", "user_id": "usr_a"})
+TOKEN_USER_B = create_token({"tenant_id": "tenant_2", "user_id": "usr_b"})
+
+AUTH_A = {"Authorization": f"Bearer {TOKEN_USER_A}"}
+AUTH_B = {"Authorization": f"Bearer {TOKEN_USER_B}"}
 
 
 def get_service(db_uri: str | None = None, conn=None):
@@ -47,7 +59,6 @@ def get_service(db_uri: str | None = None, conn=None):
         svc = VulnerableDocumentService(db_uri=db_uri, keepalive_conn=conn)
     else:
         svc = HardenedDocumentService(db_uri=db_uri, keepalive_conn=conn)
-    svc.set_session("tenant_1", "usr_a")
     return svc
 
 
@@ -108,15 +119,16 @@ def wire_request(host: str, port: int, method: str, path: str, body: bytes = b""
 # ---------------------------------------------------------------------------
 def test_cross_tenant_idor_mutation_blocked(auth_server):
     """
-    Authenticate as User A (Tenant 1). Transmit PUT /documents/doc_2 with
-    {"content": "tampered"} over TCP socket. Assert status 403/404 AND doc_2
-    in SQLite remains exactly "Tenant 2 Private Data".
+    Authenticate as User A (Tenant 1) via signed Bearer token.
+    Transmit PUT /documents/doc_2 with {"content": "tampered"} over TCP socket.
+    Assert status 403/404 AND doc_2 in SQLite remains exactly "Tenant 2 Private Data".
     """
     host, port, svc = auth_server
 
     status, body = wire_request(
         host, port, "PUT", "/documents/doc_2",
         body=json.dumps({"content": "tampered"}).encode(),
+        headers=AUTH_A,
     )
     assert status in (403, 404), (
         f"IDOR DEFECT! Cross-tenant mutation returned {status}: {body}"
@@ -132,7 +144,7 @@ def test_cross_tenant_idor_mutation_blocked(auth_server):
 # ---------------------------------------------------------------------------
 def test_sql_mutation_rowcount_integrity(auth_server):
     """
-    Issue an update against an unowned/non-existent document ID over TCP.
+    Issue an update against an unowned/non-existent document ID with User A token.
     Assert the service detects cursor.rowcount == 0 and denies the mutation with 403/404.
     """
     host, port, svc = auth_server
@@ -140,6 +152,7 @@ def test_sql_mutation_rowcount_integrity(auth_server):
     status, body = wire_request(
         host, port, "PUT", "/documents/doc_nonexistent",
         body=json.dumps({"content": "ghost"}).encode(),
+        headers=AUTH_A,
     )
     assert status in (403, 404), (
         f"ROWCOUNT DEFECT! Update to non-existent doc returned {status}: {body}"
@@ -152,13 +165,14 @@ def test_sql_mutation_rowcount_integrity(auth_server):
 @pytest.mark.parametrize("device_name", ["CON", "NUL.txt", "aux.dat"])
 def test_windows_device_names_blocked(auth_server, device_name):
     """
-    Request files named CON, NUL.txt, or aux.dat over TCP socket.
+    Request files named CON, NUL.txt, or aux.dat over TCP socket with valid auth.
     Assert rejection (400 or 403) without hanging or blocking the process.
     """
     host, port, svc = auth_server
 
     status, body = wire_request(
         host, port, "GET", f"/files/{device_name}",
+        headers=AUTH_A,
     )
     assert status in (400, 403), (
         f"DEVICE NAME DEFECT! Request for {device_name!r} returned {status}: {body}"
@@ -176,6 +190,7 @@ def test_ntfs_alternate_data_stream_blocked(auth_server):
 
     status, body = wire_request(
         host, port, "GET", "/files/file.txt:stream",
+        headers=AUTH_A,
     )
     assert status in (400, 403), (
         f"ADS DEFECT! NTFS alternate stream request returned {status}: {body}"
@@ -201,6 +216,7 @@ def test_mass_assignment_type_and_tenant_tampering(auth_server):
     status, body = wire_request(
         host, port, "PUT", "/documents/doc_1",
         body=json.dumps(payload).encode(),
+        headers=AUTH_A,
     )
     actual_content = svc.get_document_content("doc_1")
     actual_tenant = svc.get_document_field("doc_1", "tenant_id")
@@ -227,6 +243,7 @@ def test_positive_authorized_update(auth_server):
     status, body = wire_request(
         host, port, "PUT", "/documents/doc_1",
         body=json.dumps({"content": new_content}).encode(),
+        headers=AUTH_A,
     )
     assert status == 200, (
         f"POSITIVE PARITY DEFECT! Authorized update returned {status}: {body}"
@@ -237,7 +254,6 @@ def test_positive_authorized_update(auth_server):
     )
 
 
-
 # ---------------------------------------------------------------------------
 # Test 7: HTTP Parameter Pollution Rejection
 # ---------------------------------------------------------------------------
@@ -245,43 +261,32 @@ def test_http_parameter_pollution_rejection(auth_server):
     """
     Transmit PUT /documents/doc_1?tenant_id=tenant_2&tenant_id=tenant_1 with
     a valid content update over TCP socket. Assert the service ignores client
-    query parameters and binds identity strictly from the verified session context.
-
-    Hardened: Updates doc_1 using session context (tenant_1/usr_a) — HTTP 200.
-              doc_2 must remain untouched ("Tenant 2 Private Data").
-    Vulnerable: Same behavior — query params are not parsed for identity.
-              The test verifies the design principle holds across both.
+    query parameters and binds identity strictly from the verified bearer token.
     """
     host, port, svc = auth_server
 
-    # Attempt parameter pollution via duplicated query params
     status, body = wire_request(
         host, port, "PUT",
         "/documents/doc_1?tenant_id=tenant_2&tenant_id=tenant_1",
         body=json.dumps({"content": "param_pollution_test"}).encode(),
+        headers=AUTH_A,
     )
 
-    # The service must use session context, not query params.
-    # doc_1 is owned by session user (tenant_1/usr_a), so update should succeed.
     assert status == 200, (
         f"PARAMETER POLLUTION DEFECT! Authorized update with polluted query params "
         f"returned {status}: {body}"
     )
 
-    # Verify doc_1 was updated via session context
     actual_doc1 = svc.get_document_content("doc_1")
     assert actual_doc1 == "param_pollution_test", (
         f"UPDATE FAILED: doc_1 content expected 'param_pollution_test', got {actual_doc1!r}"
     )
 
-    # Verify doc_2 was NOT touched — query param tenant_id=tenant_2 must be ignored
     actual_doc2 = svc.get_document_content("doc_2")
     assert actual_doc2 == "Tenant 2 Private Data", (
-        f"PARAMETER POLLUTION DEFECT! doc_2 content changed to {actual_doc2!r} — "
-        f"query param tenant_id=tenant_2 may have been parsed for identity"
+        f"PARAMETER POLLUTION DEFECT! doc_2 content changed to {actual_doc2!r}"
     )
 
-    # Verify tenant_id of doc_1 was NOT modified by query params
     actual_tenant = svc.get_document_field("doc_1", "tenant_id")
     assert actual_tenant == "tenant_1", (
         f"PARAMETER POLLUTION DEFECT! doc_1 tenant_id changed to {actual_tenant!r}"
@@ -294,18 +299,15 @@ def test_http_parameter_pollution_rejection(auth_server):
 def test_header_identity_spoofing_ignored(auth_server):
     """
     Transmit PUT /documents/doc_1 with forged identity headers
-    (X-Tenant-ID: tenant_attacker, X-User-ID: admin) over TCP socket.
+    (X-Tenant-ID: tenant_attacker, X-User-ID: admin) alongside User A's token.
     Assert the server ignores unverified identity headers and mutates only
-    records authorized by the cryptographically verified session token.
-
-    Then attempt to read doc_2 (cross-tenant) with forged headers claiming
-    tenant_2 identity. Assert doc_2 is not returned.
+    records authorized by the verified token claims.
     """
     host, port, svc = auth_server
 
-    # Attempt identity spoofing via forged headers on a valid PUT
     spoofed_headers = {
         "Content-Type": "application/json",
+        "Authorization": f"Bearer {TOKEN_USER_A}",
         "X-Tenant-ID": "tenant_attacker",
         "X-User-ID": "admin",
         "X-Forwarded-User": "root",
@@ -317,7 +319,6 @@ def test_header_identity_spoofing_ignored(auth_server):
         headers=spoofed_headers,
     )
 
-    # Update should succeed — session context is tenant_1/usr_a who owns doc_1
     assert status == 200, (
         f"HEADER SPOOFING DEFECT! Authorized update with forged headers "
         f"returned {status}: {body}"
@@ -327,8 +328,9 @@ def test_header_identity_spoofing_ignored(auth_server):
         f"UPDATE FAILED: doc_1 content expected 'header_spoof_test', got {actual_doc1!r}"
     )
 
-    # Now attempt cross-tenant read with forged headers claiming tenant_2 identity
     spoofed_read_headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {TOKEN_USER_A}",
         "X-Tenant-ID": "tenant_2",
         "X-User-ID": "usr_b",
     }
@@ -338,15 +340,102 @@ def test_header_identity_spoofing_ignored(auth_server):
         headers=spoofed_read_headers,
     )
 
-    # Must be denied — session context is still tenant_1/usr_a, not the forged tenant_2
     assert status2 in (403, 404), (
         f"HEADER SPOOFING DEFECT! Cross-tenant mutation with forged headers "
         f"returned {status2}: {body2}"
     )
 
-    # Verify doc_2 content is unchanged
     actual_doc2 = svc.get_document_content("doc_2")
     assert actual_doc2 == "Tenant 2 Private Data", (
-        f"HEADER SPOOFING DEFECT! doc_2 content mutated to {actual_doc2!r} — "
-        f"forged X-Tenant-ID header may have been parsed for identity"
+        f"HEADER SPOOFING DEFECT! doc_2 content mutated to {actual_doc2!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 9: Wire Tampered Payload Rejected (HTTP 401)
+# ---------------------------------------------------------------------------
+def test_wire_tampered_payload_rejected_401(auth_server):
+    """
+    Craft a token where payload claims tenant_2, but signature is from tenant_1's token.
+    Assert HTTP 401 Unauthorized and database remains untouched.
+    """
+    host, port, svc = auth_server
+
+    # Forge payload to claim tenant_2 while copying signature from User A
+    orig_parts = TOKEN_USER_A.split(".")
+    tampered_payload = base64.urlsafe_b64encode(
+        json.dumps({"tenant_id": "tenant_2", "user_id": "usr_b"}, sort_keys=True).encode()
+    ).decode().rstrip("=")
+    tampered_token = f"{tampered_payload}.{orig_parts[1]}"
+
+    status, body = wire_request(
+        host, port, "PUT", "/documents/doc_2",
+        body=json.dumps({"content": "tampered_token_payload"}).encode(),
+        headers={"Authorization": f"Bearer {tampered_token}"},
+    )
+
+    assert status == 401, (
+        f"CRYPTOGRAPHIC AUTH DEFECT! Tampered token payload was accepted with status {status}: {body}"
+    )
+    actual_doc2 = svc.get_document_content("doc_2")
+    assert actual_doc2 == "Tenant 2 Private Data", (
+        f"CRYPTOGRAPHIC AUTH DEFECT! doc_2 mutated via tampered token payload: {actual_doc2!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 10: Wire Invalid Signature Rejected (HTTP 401)
+# ---------------------------------------------------------------------------
+def test_wire_invalid_signature_rejected_401(auth_server):
+    """
+    Transmit token signed with wrong secret key.
+    Assert HTTP 401 Unauthorized.
+    """
+    host, port, svc = auth_server
+
+    wrong_token = create_token({"tenant_id": "tenant_1", "user_id": "usr_a"}, secret=b"wrong-untrusted-key-bytes-12345!")
+
+    status, body = wire_request(
+        host, port, "PUT", "/documents/doc_1",
+        body=json.dumps({"content": "invalid_sig_content"}).encode(),
+        headers={"Authorization": f"Bearer {wrong_token}"},
+    )
+
+    assert status == 401, (
+        f"CRYPTOGRAPHIC AUTH DEFECT! Token with invalid signature accepted with status {status}: {body}"
+    )
+    actual_doc1 = svc.get_document_content("doc_1")
+    assert actual_doc1 != "invalid_sig_content", (
+        f"CRYPTOGRAPHIC AUTH DEFECT! doc_1 mutated via invalid signature token"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Wire Missing or Unsigned Authorization Header Rejected (HTTP 401)
+# ---------------------------------------------------------------------------
+def test_wire_missing_or_unsigned_authorization_header_rejected_401(auth_server):
+    """
+    Transmit requests with no Authorization header and with an unsigned raw string.
+    Assert both return HTTP 401 Unauthorized.
+    """
+    host, port, svc = auth_server
+
+    # Case A: Missing header entirely
+    status1, body1 = wire_request(
+        host, port, "PUT", "/documents/doc_1",
+        body=json.dumps({"content": "no_auth_content"}).encode(),
+        headers={},
+    )
+    assert status1 == 401, (
+        f"AUTH DEFECT! Request with missing Authorization header returned {status1}: {body1}"
+    )
+
+    # Case B: Plain unsigned string header
+    status2, body2 = wire_request(
+        host, port, "PUT", "/documents/doc_1",
+        body=json.dumps({"content": "unsigned_auth_content"}).encode(),
+        headers={"Authorization": "Bearer unsigned-plain-string-no-sig"},
+    )
+    assert status2 == 401, (
+        f"AUTH DEFECT! Request with unsigned Authorization header returned {status2}: {body2}"
     )

@@ -94,18 +94,20 @@ Test runners must prove their vigilance against programmatically generated defec
       sys.exit(2)  # Zero-collection / test-omission failure
   ```
 - **Automated AST Mutation Engine:**
-  The harness runner parses the production target AST and programmatically injects mutations:
+  The harness runner parses the production target AST across multi-step domain logic (e.g. transfers, fee calculations, audit logs) and programmatically injects mutations:
   1. *Comparison Inversions:* `Gt` <-> `LtE`, `GtE` <-> `Lt`, `Eq` <-> `NotEq` (flipping boundary conditions).
   2. *Boundary Equality Mutations:* Strict vs non-strict inequalities: `Lt` <-> `LtE`, `Gt` <-> `GtE` (catching off-by-one boundary leaks where exact balance or capacity is tested).
   3. *Boolean Inversions:* `Constant(value=True)` <-> `Constant(value=False)` (flipping validation outcomes).
   4. *Arithmetic Inversions:* `Add` <-> `Sub`, `Mult` <-> `FloorDiv` on binary operations and `AugAssign` (catching reversed deduction/credit arithmetic).
-  5. *Statement Stripping:* Replacing state mutation `AugAssign` (deductions / credits) with `Pass`.
-  6. *Return Neutralisation:* Replacing return values with `None`.
-  7. *Exception Swallowing:* Replacing statement blocks inside `ExceptHandler` with `Pass` (verifying harnesses catch silent failure suppression).
-- **Mutation Kill Score Threshold (>= 90% across 15+ mutants):**
+  5. *Statement Stripping & Deletion:* Replacing state mutation `AugAssign` (deductions / credits) or `Call` expressions (e.g. audit logging calls) with `Pass`.
+  6. *Argument Order Swapping:* Inverting parameter ordering on function calls (`Call.args[0] <-> Call.args[1]`) to detect positional parameter mixups.
+  7. *Constant Value Offsets:* Offsetting integer constants by +1 and -1 to detect hardcoded threshold and fee calculation bugs.
+  8. *Return Neutralisation:* Replacing return values with `None`.
+  9. *Exception Swallowing:* Replacing statement blocks inside `ExceptHandler` with `Pass` (verifying harnesses catch silent failure suppression).
+- **Mutation Kill Score Threshold (>= 90% across 20+ mutants):**
   For every generated mutant, the test suite must execute and terminate with a non-zero exit code (`exit code != 0`).
   $$\text{Mutation Score} = \left( \frac{\text{Mutants Killed}}{\text{Total Mutants}} \right) \times 100 \ge 90\%$$
-  Any mutant that slips through unnoticed indicates a gap or vague assertion in the test suite (such as failing to test exact boundary equality values).
+  The mutation engine must discover at least 20 distinct valid mutants across multi-method services. Any mutant that slips through unnoticed indicates a gap or vague assertion in the test suite.
 - **Deterministic Exit Codes:**
   - Collection guard violation: Exit Code 2.
   - Test suite assertion failure or mutation score < 90%: Exit Code 1.

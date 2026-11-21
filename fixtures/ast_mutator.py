@@ -6,7 +6,9 @@ Implements programmatic defect injection directly on Python abstract syntax tree
   - Boundary comparison mutations (Lt <-> LtE, Gt <-> GtE — strict vs non-strict)
   - Boolean literal inversion (True <-> False)
   - Off-by-one arithmetic mutations (Add <-> Sub, Mult <-> FloorDiv)
-  - Statement stripping (balance deduction AugAssign -> Pass)
+  - Statement stripping / deletion (AugAssign -> Pass, Call Expr -> Pass)
+  - Argument order swapping (Call arg0 <-> arg1)
+  - Constant value offsets (Int Constant +1 / -1)
   - Return value neutralisation (Return(val) -> Return(None))
   - Exception swallowing mutations (ExceptHandler body -> Pass)
 """
@@ -87,6 +89,21 @@ class ASTMutator(ast.NodeTransformer):
             if self.target_id == site_id:
                 node.value = not node.value
             self.current_idx += 1
+        elif type(node.value) is int:
+            site_inc = f"const_inc_{self.current_idx}"
+            desc_inc = f"Constant_offset_plus_1_{node.value}_to_{node.value + 1}"
+            self.available_targets.append((site_inc, desc_inc))
+            if self.target_id == site_inc:
+                node.value = node.value + 1
+            self.current_idx += 1
+
+            site_dec = f"const_dec_{self.current_idx}"
+            desc_dec = f"Constant_offset_minus_1_{node.value}_to_{node.value - 1}"
+            self.available_targets.append((site_dec, desc_dec))
+            if self.target_id == site_dec:
+                node.value = node.value - 1
+            self.current_idx += 1
+
         return node
 
     def visit_AugAssign(self, node: ast.AugAssign) -> ast.AST:
@@ -139,6 +156,31 @@ class ASTMutator(ast.NodeTransformer):
             self.current_idx += 1
         return node
 
+    def visit_Expr(self, node: ast.Expr) -> ast.AST:
+        self.generic_visit(node)
+        if isinstance(node.value, ast.Call):
+            site_id = f"delete_stmt_{self.current_idx}"
+            desc = "Delete_Call_statement_to_Pass"
+            self.available_targets.append((site_id, desc))
+            if self.target_id == site_id:
+                pass_node = ast.Pass()
+                ast.copy_location(pass_node, node)
+                self.current_idx += 1
+                return pass_node
+            self.current_idx += 1
+        return node
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        self.generic_visit(node)
+        if len(node.args) >= 2:
+            site_id = f"swap_args_{self.current_idx}"
+            desc = "Swap_first_two_arguments"
+            self.available_targets.append((site_id, desc))
+            if self.target_id == site_id:
+                node.args[0], node.args[1] = node.args[1], node.args[0]
+            self.current_idx += 1
+        return node
+
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> ast.AST:
         self.generic_visit(node)
         if node.body and not (len(node.body) == 1 and isinstance(node.body[0], ast.Pass)):
@@ -157,7 +199,7 @@ def generate_mutants(source_code: str) -> List[Tuple[str, str]]:
     """
     Parses source code to AST, discovers all mutation sites,
     and returns a list of (mutant_name, mutated_source_code).
-    Guarantees at least 15 distinct, syntactically valid mutants.
+    Guarantees at least 20 distinct, syntactically valid mutants.
     """
     tree = ast.parse(source_code)
 

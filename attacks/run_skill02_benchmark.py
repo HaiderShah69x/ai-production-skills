@@ -29,7 +29,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from fixtures.ast_mutator import generate_mutants
 
-MIN_REQUIRED_TESTS = 5
+MIN_REQUIRED_TESTS = 10
 REQUIRED_MUTATION_SCORE = 90.0  # percentage
 
 
@@ -73,8 +73,8 @@ def run_ast_mutation_engine() -> Tuple[int, float]:
     total_mutants = len(mutants)
 
     print(f"  Generated {total_mutants} AST mutants from {SOURCE_FILE.name}", flush=True)
-    if total_mutants < 15:
-        print(f"  [FAIL] Mutation engine produced {total_mutants} mutants; expected at least 15.", flush=True)
+    if total_mutants < 20:
+        print(f"  [FAIL] Mutation engine produced {total_mutants} mutants; expected at least 20.", flush=True)
         return (1, 0.0)
 
     killed_mutants = 0

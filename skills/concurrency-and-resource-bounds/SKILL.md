@@ -170,58 +170,75 @@ def read_bounded_body(request):
 
 ---
 
-## Invariant 3 — Bounded Socket Lifecycles & Absolute Deadlines
+## Invariant 3 — Bounded Socket Lifecycles, Connection Pools & Anti-Slowloris Starvation
 
 ### Rule
 
-Every network connection — inbound or outbound — must have explicit deadlines
-and must be released on disconnect, idle timeout, or cumulative deadline breach.
+Every network connection — inbound or outbound — must have explicit deadlines,
+global pool capacity bounds, and must be released on disconnect, idle timeout,
+or cumulative deadline breach without starving concurrent legitimate traffic.
 
 ### Requirements
 
+- **Global Connection Pool Bounding (`BoundedSemaphore`):**
+  Servers must enforce a hard upper limit on concurrently active socket connections
+  (e.g., `MAX_CONCURRENT_CONNECTIONS = 30`). When the connection pool is saturated,
+  inbound connections must be immediately rejected with **HTTP 503 Service Unavailable**
+  or **HTTP 429 Too Many Requests** (`{"error": "connection_pool_exhausted"}`) and
+  cleanly closed without spawning unbounded worker threads or consuming server memory.
+  Pool permits must be strictly released in a `finally` block when the connection closes.
 - **Enforce Dual Deadlines (Idle Timeout + Absolute Request Deadline):**
   - **Per-read/write Idle Timeout (`READ_TIMEOUT`):** Reclaims dead sockets when no bytes
     are received within an idle window (e.g., 2.0s).
   - **Absolute Cumulative Request Deadline (`ABSOLUTE_REQUEST_TIMEOUT`):** Limits the total
     wall-clock lifetime of the entire request/transfer (e.g., 4.0s). This is strictly required
-    to eliminate **slow-drip (Slowloris) attacks**, where an adversary sends 1 byte just
-    frequently enough to reset an idle timer while exhausting server workers.
+    to defeat **Slowloris attacks**, where an adversary sends 1 byte just frequently
+    enough to reset an idle timer while holding server worker slots open indefinitely.
+- **Anti-Slowloris Starvation Guarantees:**
+  The server must guarantee that concurrent legitimate business traffic is **not starved**
+  during multi-socket Slowloris attacks. Healthy requests must complete with sub-second latency
+  (e.g. <= 1.0s) and receive clean response codes (HTTP 200 or 409) rather than suffering
+  timeouts or connection drops.
 - **Abort stalled connections.** A connection that breaches either deadline must be terminated:
   respond with **HTTP 408 Request Timeout** (for inbound) or surface a timeout error
   (for outbound), then close the raw socket.
 - **Guarantee resource release.** Use `defer conn.Close()`, `try/finally`,
-  `using` statements, or equivalent RAII patterns so that file descriptors are
-  reclaimed on normal exit, timeout, *and* exception paths.
+  `using` statements, or equivalent RAII patterns so that file descriptors and connection
+  permits are reclaimed on normal exit, timeout, *and* exception paths.
 - **Handle resets cleanly.** Handle `ConnectionResetError`, `BrokenPipeError`, and connection
   aborts without leaking unhandled tracebacks or crashing daemon threads.
 
 ### Canonical Pattern (pseudo-code)
 
 ```python
-READ_TIMEOUT             = 2.0  # seconds between packet chunks
-ABSOLUTE_REQUEST_TIMEOUT = 4.0  # seconds maximum total duration
+MAX_CONCURRENT_CONNECTIONS = 30
+READ_TIMEOUT               = 2.0  # seconds between packet chunks
+ABSOLUTE_REQUEST_TIMEOUT   = 4.0  # seconds maximum total duration
+POOL_SEMAPHORE             = threading.BoundedSemaphore(MAX_CONCURRENT_CONNECTIONS)
 
 def handle_connection(conn):
-    start_time = time.monotonic()
-    conn.set_timeout(READ_TIMEOUT)
+    # Non-blocking or bounded acquisition of connection pool slot
+    if not POOL_SEMAPHORE.acquire(blocking=True, timeout=1.0):
+        send_http_503(conn, '{"error": "connection_pool_exhausted"}')
+        conn.close()
+        return
+
+    # Enforce absolute wall-clock request deadline across the entire connection
+    deadline_timer = threading.Timer(ABSOLUTE_REQUEST_TIMEOUT, lambda: abort_socket(conn))
+    deadline_timer.daemon = True
+    deadline_timer.start()
+
     try:
+        conn.set_timeout(READ_TIMEOUT)
         while True:
-            elapsed = time.monotonic() - start_time
-            if elapsed >= ABSOLUTE_REQUEST_TIMEOUT:
-                raise TimeoutError("Cumulative deadline exceeded")
-            
-            # Dynamic window bounds individual reads to the remaining absolute deadline
-            remaining = ABSOLUTE_REQUEST_TIMEOUT - elapsed
-            conn.set_timeout(min(READ_TIMEOUT, remaining))
-            
             chunk = conn.recv(CHUNK_SIZE)
             if not chunk:
                 break
             process_chunk(chunk)
-    except TimeoutError:
-        conn.sendall(b"HTTP/1.1 408 Request Timeout\r\n\r\n")
     finally:
+        deadline_timer.cancel()
         conn.close()
+        POOL_SEMAPHORE.release()  # Strictly release pool slot
 ```
 
 ---
@@ -250,12 +267,17 @@ Send requests exceeding `MAX_BODY_SIZE`:
 - The server does **not** read beyond `MAX_BODY_SIZE` into memory.
 - The server does **not** crash or hang.
 
-### 3. Idle Timeout & Slow-Drip Test
+### 3. Idle Timeout & Multi-Socket Slowloris Pool Exhaustion Test
 
-- **Idle Stall Test:** Open a connection, send partial headers/body, and halt. Verify
+- **Idle Stall Test (B2):** Open a connection, send partial headers/body, and halt. Verify
   the server closes the socket within `READ_TIMEOUT` + grace window.
-- **Slow Drip Test:** Send 1 byte periodically right under the `READ_TIMEOUT` threshold.
-  Verify the server enforces the `ABSOLUTE_REQUEST_TIMEOUT` and terminates the connection.
+- **Slowloris Pool Exhaustion & Anti-Starvation Test (B3):** Open 35 concurrent slow-drip client
+  sockets simultaneously against a server bounded at `MAX_CONCURRENT_CONNECTIONS = 30` (sending 1 byte
+  every 1.5s to bypass the 2.0s idle timeout). Verify:
+  1. Exactly 5 excess connections exceeding the pool cap are immediately rejected with **HTTP 503 Service Unavailable** (`{"error": "connection_pool_exhausted"}`).
+  2. Exactly 30 connections acquire pool slots and are forcefully terminated by the server's deadline within `ABSOLUTE_REQUEST_TIMEOUT + 1.5s grace`.
+  3. Following pool recovery, 5 concurrent legitimate `POST /buy` requests execute and perform genuine transactional commits, returning HTTP 200 within <= 1.0s and verifying database state transitions (`remaining == 5, sold == 5`).
+  4. The server suffers zero unhandled crashes or dropped healthy connections.
 
 ### Anti-Patterns Forbidden in Tests
 
@@ -273,9 +295,10 @@ Send requests exceeding `MAX_BODY_SIZE`:
 - [ ] Idempotency keys specified for duplicate submission handling where applicable.
 - [ ] `MAX_BODY_SIZE` constant defined and enforced upfront via `Content-Length`.
 - [ ] Incremental byte-counting streaming loop active for chunked/streaming/decompressed payloads.
+- [ ] Global active connection limiter (`BoundedSemaphore`) and fast-reject HTTP 503 on pool saturation.
 - [ ] Dual timeouts active: idle read/write timeout AND absolute request deadline.
 - [ ] `defer` / `finally` / `using` guarantees connection cleanup on all paths.
 - [ ] Concurrent quota test included and passing.
 - [ ] HTTP 413 oversized payload test included and passing.
-- [ ] Idle stall test (B2) and slow-drip test (B3) included and passing.
+- [ ] Idle stall test (B2) and Slowloris pool exhaustion anti-starvation test (B3) included and passing.
 - [ ] No empty `catch` blocks in test or production code.

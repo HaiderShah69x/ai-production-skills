@@ -2,16 +2,21 @@
 fixtures/auth_fixtures.py — SQLite-backed vulnerable and hardened document services.
 
 Replaces in-memory mock abstractions with real database state, live TCP loopback
-server harness, and OS-level handle containment using isolated in-memory SQLite URIs.
+server harness, cryptographic HMAC-SHA256 bearer tokens, and OS-level handle containment
+using isolated in-memory SQLite URIs.
 
 Production blind spots covered:
   1. Cross-tenant IDOR via un-scoped SQL mutations.
   2. Path traversal, symlink/junction escapes, NTFS ADS, Windows device names.
   3. Mass-assignment of tenant_id, owner_id, role, or arbitrary keys.
   4. TOCTOU filesystem races defeated via handle-based path confinement.
+  5. Cryptographic token verification rejecting missing, malformed, or tampered tokens.
 """
 
+import base64
 import ctypes
+import hashlib
+import hmac
 import json
 import os
 import pathlib
@@ -35,6 +40,46 @@ SECRET_FILE.write_text("SUPER_SECRET_API_KEY_9999", encoding="utf-8")
 _WINDOWS_RESERVED = re.compile(
     r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..+)?$", re.IGNORECASE
 )
+
+# ---------------------------------------------------------------------------
+# Cryptographic Token Authentication (HMAC-SHA256)
+# ---------------------------------------------------------------------------
+HMAC_SECRET = b"production-secure-hmac-secret-key-32b!"
+
+
+def create_token(payload: dict, secret: bytes = HMAC_SECRET) -> str:
+    """Create signed HMAC-SHA256 bearer token: base64(payload).base64(hmac)."""
+    payload_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    payload_b64 = base64.urlsafe_b64encode(payload_bytes).decode("ascii").rstrip("=")
+    sig = hmac.new(secret, payload_b64.encode("ascii"), hashlib.sha256).digest()
+    sig_b64 = base64.urlsafe_b64encode(sig).decode("ascii").rstrip("=")
+    return f"{payload_b64}.{sig_b64}"
+
+
+def verify_token(token: str, secret: bytes = HMAC_SECRET) -> dict | None:
+    """Verify signed HMAC-SHA256 bearer token. Returns payload dict or None on tampered/invalid signature."""
+    try:
+        if not token or "." not in token:
+            return None
+        parts = token.split(".")
+        if len(parts) != 2:
+            return None
+        payload_b64, sig_b64 = parts[0], parts[1]
+        expected_sig = hmac.new(secret, payload_b64.encode("ascii"), hashlib.sha256).digest()
+        rem_sig = len(sig_b64) % 4
+        padded_sig = sig_b64 + ("=" * (4 - rem_sig) if rem_sig else "")
+        actual_sig = base64.urlsafe_b64decode(padded_sig.encode("ascii"))
+        if not hmac.compare_digest(expected_sig, actual_sig):
+            return None
+        rem_p = len(payload_b64) % 4
+        padded_payload = payload_b64 + ("=" * (4 - rem_p) if rem_p else "")
+        payload_bytes = base64.urlsafe_b64decode(padded_payload.encode("ascii"))
+        claims = json.loads(payload_bytes.decode("utf-8"))
+        if not isinstance(claims, dict):
+            return None
+        return claims
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -114,12 +159,6 @@ class VulnerableDocumentService:
             self.db_uri = db_uri
             self._keepalive_conn = keepalive_conn
         self.base_dir = PUBLIC_FILES_DIR
-        self.session_tenant_id: str = ""
-        self.session_user_id: str = ""
-
-    def set_session(self, tenant_id: str, user_id: str) -> None:
-        self.session_tenant_id = tenant_id
-        self.session_user_id = user_id
 
     def reset_db(self) -> None:
         conn = sqlite3.connect(self.db_uri, uri=True)
@@ -131,7 +170,7 @@ class VulnerableDocumentService:
         finally:
             conn.close()
 
-    def update_document(self, doc_id: str, new_content: str) -> Tuple[int, dict]:
+    def update_document(self, doc_id: str, new_content: str, caller_tenant_id: str = "", caller_user_id: str = "") -> Tuple[int, dict]:
         """FLAW: Insecure query ignoring tenant and owner boundaries, and ignoring rowcount."""
         conn = sqlite3.connect(self.db_uri, uri=True)
         try:
@@ -150,7 +189,7 @@ class VulnerableDocumentService:
         with open(target, "r", encoding="utf-8") as f:
             return f.read()
 
-    def update_document_fields(self, doc_id: str, data: Dict[str, Any]) -> Tuple[int, dict]:
+    def update_document_fields(self, doc_id: str, data: Dict[str, Any], caller_tenant_id: str = "", caller_user_id: str = "") -> Tuple[int, dict]:
         """FLAW: Direct dictionary assignment accepting any key (allowing mass assignment)."""
         conn = sqlite3.connect(self.db_uri, uri=True)
         conn.row_factory = sqlite3.Row
@@ -177,7 +216,7 @@ class VulnerableDocumentService:
         finally:
             conn.close()
 
-    def get_document_content(self, doc_id: str) -> str | None:
+    def get_document_content(self, doc_id: str, caller_tenant_id: str | None = None) -> str | None:
         conn = sqlite3.connect(self.db_uri, uri=True)
         conn.row_factory = sqlite3.Row
         try:
@@ -209,12 +248,13 @@ class VulnerableDocumentService:
 class HardenedDocumentService:
     """
     Production-grade service enforcing:
-      - Compound SQL mutation: UPDATE documents SET content = ? WHERE id = ? AND tenant_id = ? AND owner_id = ?;
+      - Compound SQL mutation with dynamic caller identity:
+        UPDATE documents SET content = ? WHERE id = ? AND tenant_id = ? AND owner_id = ?;
       - Verifies cursor.rowcount == 1. If rowcount == 0, rolls back and returns HTTP 404/403.
       - Handle-Based Path Confinement (TOCTOU Defense):
         * Reject any filename containing ':' immediately (blocks NTFS Alternate Data Streams).
         * Strip trailing dots ('.') and whitespace before path evaluation.
-        * Reject Windows reserved device names: CON, PRN, AUX, NUL, COM1-COM9, LPT1-LPT9 (case-insensitive check against filename stem).
+        * Reject Windows reserved device names: CON, PRN, AUX, NUL, COM1-COM9, LPT1-LPT9.
         * Resolve target canonically and strictly enforce target.resolve().is_relative_to(base_dir.resolve()) and target != base_dir.
         * Open file descriptor via os.open(), query canonical device volume path from handle (GetFinalPathNameByHandleW on Windows),
           strip '\\?\\' prefixes, and verify handle containment before reading.
@@ -233,12 +273,6 @@ class HardenedDocumentService:
             self.db_uri = db_uri
             self._keepalive_conn = keepalive_conn
         self.base_dir = PUBLIC_FILES_DIR
-        self.session_tenant_id: str = ""
-        self.session_user_id: str = ""
-
-    def set_session(self, tenant_id: str, user_id: str) -> None:
-        self.session_tenant_id = tenant_id
-        self.session_user_id = user_id
 
     def reset_db(self) -> None:
         conn = sqlite3.connect(self.db_uri, uri=True)
@@ -250,13 +284,13 @@ class HardenedDocumentService:
         finally:
             conn.close()
 
-    def update_document(self, doc_id: str, new_content: str) -> Tuple[int, dict]:
-        """Compound SQL mutation with rowcount verification."""
+    def update_document(self, doc_id: str, new_content: str, caller_tenant_id: str, caller_user_id: str) -> Tuple[int, dict]:
+        """Compound SQL mutation with caller identity parameter binding and rowcount verification."""
         conn = sqlite3.connect(self.db_uri, uri=True)
         try:
             cur = conn.execute(
                 "UPDATE documents SET content = ? WHERE id = ? AND tenant_id = ? AND owner_id = ?;",
-                (new_content, doc_id, self.session_tenant_id, self.session_user_id),
+                (new_content, doc_id, caller_tenant_id, caller_user_id),
             )
             if cur.rowcount == 0:
                 conn.rollback()
@@ -328,7 +362,7 @@ class HardenedDocumentService:
                 except OSError:
                     pass
 
-    def update_document_fields(self, doc_id: str, data: Dict[str, Any]) -> Tuple[int, dict]:
+    def update_document_fields(self, doc_id: str, data: Dict[str, Any], caller_tenant_id: str, caller_user_id: str) -> Tuple[int, dict]:
         """Strict schema allowlist: only permits updating title and content as strings."""
         sanitized = {}
         for key, expected_type in self.ALLOWED_UPDATE_FIELDS.items():
@@ -340,7 +374,7 @@ class HardenedDocumentService:
 
         set_clause = ", ".join(f"{k} = ?" for k in sanitized)
         values = list(sanitized.values()) + [
-            doc_id, self.session_tenant_id, self.session_user_id
+            doc_id, caller_tenant_id, caller_user_id
         ]
 
         conn = sqlite3.connect(self.db_uri, uri=True)
@@ -357,13 +391,18 @@ class HardenedDocumentService:
         finally:
             conn.close()
 
-    def get_document_content(self, doc_id: str) -> str | None:
+    def get_document_content(self, doc_id: str, caller_tenant_id: str | None = None) -> str | None:
         conn = sqlite3.connect(self.db_uri, uri=True)
         conn.row_factory = sqlite3.Row
         try:
-            row = conn.execute(
-                "SELECT content FROM documents WHERE id = ?;", (doc_id,)
-            ).fetchone()
+            if caller_tenant_id is not None:
+                row = conn.execute(
+                    "SELECT content FROM documents WHERE id = ? AND tenant_id = ?;", (doc_id, caller_tenant_id)
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT content FROM documents WHERE id = ?;", (doc_id,)
+                ).fetchone()
             return row["content"] if row else None
         finally:
             conn.close()
@@ -383,13 +422,14 @@ class HardenedDocumentService:
 
 
 # ---------------------------------------------------------------------------
-# Loopback Server & Request Handler
+# Loopback Server & Request Handler with Dynamic Token Verification
 # ---------------------------------------------------------------------------
 
 class AuthRequestHandler(BaseHTTPRequestHandler):
     """
     Lightweight HTTP request handler exposing document and file endpoints
-    over live TCP sockets. Identity context is strictly bound from service session.
+    over live TCP sockets. Identity context is strictly resolved from cryptographically
+    verified HMAC-SHA256 bearer tokens.
     """
 
     def log_message(self, format, *args):  # noqa: A002
@@ -407,7 +447,25 @@ class AuthRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _authenticate(self) -> Tuple[str, str] | None:
+        """Extract and verify HMAC-SHA256 bearer token. Returns (tenant_id, user_id) or sends 401."""
+        auth_header = self.headers.get("Authorization", "")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            self._send_json(401, {"error": "unauthorized", "detail": "Missing or malformed Authorization header"})
+            return None
+        token = auth_header[7:].strip()
+        claims = verify_token(token)
+        if claims is None or "tenant_id" not in claims or "user_id" not in claims:
+            self._send_json(401, {"error": "unauthorized", "detail": "Invalid or tampered token"})
+            return None
+        return str(claims["tenant_id"]), str(claims["user_id"])
+
     def do_PUT(self) -> None:
+        identity = self._authenticate()
+        if identity is None:
+            return
+        caller_tenant_id, caller_user_id = identity
+
         path_only = self.path.split("?", 1)[0]
         parts = [p for p in path_only.strip("/").split("/") if p]
         if len(parts) == 2 and parts[0] == "documents":
@@ -425,21 +483,26 @@ class AuthRequestHandler(BaseHTTPRequestHandler):
                 return
 
             if set(body.keys()) == {"content"} and isinstance(body["content"], str):
-                status, res = self.service.update_document(doc_id, body["content"])
+                status, res = self.service.update_document(doc_id, body["content"], caller_tenant_id, caller_user_id)
             else:
-                status, res = self.service.update_document_fields(doc_id, body)
+                status, res = self.service.update_document_fields(doc_id, body, caller_tenant_id, caller_user_id)
             self._send_json(status, res)
             return
 
         self._send_json(404, {"error": "not found"})
 
     def do_GET(self) -> None:
+        identity = self._authenticate()
+        if identity is None:
+            return
+        caller_tenant_id, caller_user_id = identity
+
         path_only = self.path.split("?", 1)[0]
         parts = [p for p in path_only.strip("/").split("/") if p]
 
         if len(parts) == 2 and parts[0] == "documents":
             doc_id = parts[1]
-            content = self.service.get_document_content(doc_id)
+            content = self.service.get_document_content(doc_id, caller_tenant_id)
             if content is not None:
                 self._send_json(200, {"id": doc_id, "content": content})
             else:

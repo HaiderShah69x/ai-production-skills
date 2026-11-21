@@ -5,7 +5,7 @@ Demonstrates canonical production blind spots:
   1. Non-atomic check-then-update at the database layer (lost-update race):
      SELECT remaining ... -> if remaining > 0 -> sleep -> UPDATE stock SET remaining = ...
   2. Unbounded payload read trusting Content-Length with no cap.
-  3. No socket deadlines or timeouts.
+  3. No socket deadlines, timeouts, or connection pool bounds (vulnerable to Slowloris connection pool exhaustion).
 
 DO NOT use this code in production. It exists solely as an attack target.
 """

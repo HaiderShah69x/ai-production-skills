@@ -32,6 +32,7 @@ import pathlib
 import re
 import select
 import socket
+import sqlite3
 import sys
 import threading
 import time
@@ -492,124 +493,236 @@ def attack_b2(mode: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Attack B3 — slow-drip attack (bypasses idle timeout via trickle sends)
+# Attack B3 — Slowloris connection pool exhaustion & anti-starvation
 # ---------------------------------------------------------------------------
-def attack_b3(mode: str) -> None:
-    header("Attack B3: Slow-Drip — Absolute Request Deadline (POST /upload)")
+def attack_b3_slowloris_pool_exhaustion(mode: str) -> None:
+    header("Attack B3: Slowloris Pool Exhaustion & Anti-Starvation (POST /upload + POST /buy)")
 
-    # Strategy: declare Content-Length: 100, then send 1 byte every 1.2 s.
-    # Each inter-byte gap (1.2 s) is just below the idle READ_TIMEOUT (2.0 s),
-    # so a server that only enforces an idle timeout will never fire it.
-    # Only an ABSOLUTE_REQUEST_TIMEOUT (e.g. 4.0 s wall-clock) will close this.
-    DRIP_INTERVAL  = 1.2   # seconds between each byte — stays under idle timeout
-    DRIP_COUNT     = 5     # bytes sent in total (of the promised 100)
-    TOTAL_DURATION = DRIP_INTERVAL * DRIP_COUNT   # 6.0 s total experiment window
-    ABS_DEADLINE   = 4.0   # hardened_app.py ABSOLUTE_REQUEST_TIMEOUT
-    GRACE          = 1.0   # allow up to deadline + grace before calling it hung
+    SLOW_CLIENTS    = 35    # concurrent slow-drip sockets (exceeds MAX_CONCURRENT_CONNECTIONS = 30)
+    LEGIT_CLIENTS   = 5     # concurrent legitimate business requests
+    DRIP_INTERVAL   = 1.5   # seconds between each trickle byte (stays under READ_TIMEOUT=2.0s)
+    DRIP_COUNT      = 4     # 4 gaps * 1.5s = 6.0s total experiment duration
+    ABS_DEADLINE    = 4.0   # hardened ABSOLUTE_REQUEST_TIMEOUT
+    GRACE           = 1.5   # allow up to deadline + grace before declaring hung
+    CUTOFF          = ABS_DEADLINE + GRACE  # 5.5s
+
+    # Reset database stock and connection pool before Attack B3
+    target_module = sys.modules.get("_target_app")
+    if target_module and hasattr(target_module, "reset_connection_pool"):
+        target_module.reset_connection_pool()
+
+    db_file = REPO_ROOT / "fixtures" / ("store_hardened.db" if mode == "hardened" else "store_vulnerable.db")
+    conn = sqlite3.connect(db_file)
+    with conn:
+        conn.execute("UPDATE stock SET remaining = 10, sold = 0 WHERE id = 1;")
+    conn.close()
 
     print(
-        f"  Target         : {mode}\n"
-        f"  Strategy       : send 1 byte every {DRIP_INTERVAL}s "
-        f"({DRIP_COUNT} bytes of promised 100)\n"
-        f"  Idle timeout   : 2.0s (each gap stays below it)\n"
-        f"  Abs deadline   : {ABS_DEADLINE}s (hardened only)\n"
-        f"  Experiment cap : {TOTAL_DURATION}s",
+        f"  Target          : {mode}\n"
+        f"  Database stock  : reset to remaining=10, sold=0\n"
+        f"  Slowloris pool  : {SLOW_CLIENTS} concurrent slow-drip sockets (cap = 30)\n"
+        f"  Abs deadline    : {ABS_DEADLINE}s (hardened only)\n"
+        f"  Experiment cap  : {DRIP_INTERVAL * DRIP_COUNT}s",
         flush=True,
     )
 
-    headers_raw = (
-        "POST /upload HTTP/1.1\r\n"
-        f"Host: {HOST}:{PORT}\r\n"
-        "Content-Length: 100\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-    ).encode()
+    ready_barrier = threading.Barrier(SLOW_CLIENTS)
+    slow_closed_times: dict[int, float] = {}
+    slow_503_flags: dict[int, bool] = {}
 
-    closed_at: float = TOTAL_DURATION + 1.0   # sentinel: "never closed"
-    start = time.monotonic()
-
-    try:
-        sock = socket.create_connection((HOST, PORT), timeout=10)
+    def slow_worker(idx: int) -> None:
+        t0 = time.monotonic()
+        closed_at = 999.0
+        got_503 = False
+        sock = None
         try:
-            sock.sendall(headers_raw)
-
-            for i in range(DRIP_COUNT):
-                time.sleep(DRIP_INTERVAL)
-                try:
-                    # Try to send 1 drip byte; if the server already closed
-                    # the connection this will raise BrokenPipeError / ECONNRESET / OSError
-                    sock.sendall(bytes([0x41 + i]))   # 'A', 'B', …
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    closed_at = time.monotonic() - start
-                    break
-                # Also try a non-blocking peek for a server-sent close / 408
-                try:
-                    sock.settimeout(0.05)
-                    data = sock.recv(256)
-                    if not data or b"408" in data or b"close" in data.lower():
-                        closed_at = time.monotonic() - start
-                        break
-                except socket.timeout:
-                    continue   # server still open — keep dripping
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    closed_at = time.monotonic() - start
-                    break
-
-            if closed_at > TOTAL_DURATION:
-                # Read one last time with a short timeout to catch a late close
-                try:
-                    sock.settimeout(0.5)
-                    data = sock.recv(256)
-                    if not data or b"408" in data:
-                        closed_at = time.monotonic() - start
-                except (socket.timeout, BrokenPipeError, ConnectionResetError, OSError):
-                    pass   # confirmed hung
-
-        finally:
+            sock = socket.create_connection((HOST, PORT), timeout=10)
             try:
-                sock.close()
+                ready_barrier.wait(timeout=5.0)
             except Exception:
                 pass
-    except (BrokenPipeError, ConnectionResetError, OSError) as exc:
-        closed_at = time.monotonic() - start
-    except Exception as exc:
-        print(f"  (unexpected error: {exc})", flush=True)
-        closed_at = 0.0
 
-    elapsed = time.monotonic() - start
-    hung    = closed_at > (ABS_DEADLINE + GRACE)
+            headers = (
+                "POST /upload HTTP/1.1\r\n"
+                f"Host: {HOST}:{PORT}\r\n"
+                "Content-Length: 1000\r\n"
+                "Content-Type: application/octet-stream\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            ).encode()
+            sock.sendall(headers)
+
+            # Check if server immediately rejected with 503 (connection pool exhausted)
+            r, _, _ = select.select([sock], [], [], 0.5)
+            if r:
+                try:
+                    data = sock.recv(1024)
+                    if b"503" in data and b"connection_pool_exhausted" in data:
+                        got_503 = True
+                        closed_at = time.monotonic() - t0
+                except Exception:
+                    pass
+
+            if not got_503:
+                for i in range(DRIP_COUNT):
+                    time.sleep(DRIP_INTERVAL)
+                    try:
+                        sock.sendall(bytes([0x41 + (i % 26)]))
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        closed_at = time.monotonic() - t0
+                        break
+                    try:
+                        sock.settimeout(0.05)
+                        data = sock.recv(256)
+                        if not data or b"408" in data or b"close" in data.lower():
+                            closed_at = time.monotonic() - t0
+                            break
+                    except socket.timeout:
+                        continue
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        closed_at = time.monotonic() - t0
+                        break
+
+                if closed_at == 999.0:
+                    try:
+                        sock.settimeout(0.5)
+                        data = sock.recv(256)
+                        if not data or b"408" in data:
+                            closed_at = time.monotonic() - t0
+                    except Exception:
+                        pass
+        except Exception:
+            closed_at = time.monotonic() - t0
+        finally:
+            if sock:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            slow_503_flags[idx] = got_503
+            slow_closed_times[idx] = closed_at
+
+    slow_threads = [
+        threading.Thread(target=slow_worker, args=(i,), daemon=True)
+        for i in range(SLOW_CLIENTS)
+    ]
+    for t in slow_threads:
+        t.start()
+
+    # Wait for all slowloris threads to complete (either via 503 or 4.0s deadline)
+    for t in slow_threads:
+        t.join(timeout=8.0)
+
+    closed_values = list(slow_closed_times.values())
+    count_503 = sum(1 for v in slow_503_flags.values() if v)
+    acquired_count = SLOW_CLIENTS - count_503
+    hung_slow = sum(1 for idx, c in slow_closed_times.items() if not slow_503_flags.get(idx, False) and c > CUTOFF)
+    terminated_slow = acquired_count - hung_slow
+    acquired_closed_vals = [c for idx, c in slow_closed_times.items() if not slow_503_flags.get(idx, False)]
+    avg_closed = sum(acquired_closed_vals) / len(acquired_closed_vals) if acquired_closed_vals else 0.0
 
     print(
-        f"  Closed at      : {closed_at:.2f}s  "
-        f"(experiment ran {elapsed:.2f}s)  |  Hung: {hung}",
+        f"  Excess sockets (503): {count_503}/{SLOW_CLIENTS} rejected immediately with HTTP 503\n"
+        f"  Acquired sockets    : {terminated_slow}/{acquired_count} terminated within deadline "
+        f"({hung_slow} hung past {CUTOFF:.1f}s)",
         flush=True,
     )
 
     if mode == "vulnerable":
-        if hung:
+        if hung_slow > 0:
             log_pass(
-                f"Vulnerability confirmed: server accepted slow-drip for "
-                f"{closed_at:.2f}s — no absolute request deadline enforced."
+                f"Vulnerability confirmed: server held {hung_slow}/{SLOW_CLIENTS} "
+                f"slow-drip sockets open beyond {CUTOFF:.1f}s (no absolute deadline enforced)."
             )
         else:
             log_fail(
-                f"Expected server to stay open for the full drip experiment; "
-                f"closed after {closed_at:.2f}s. App may already have an "
-                "absolute deadline (unexpected on the vulnerable fixture)."
+                "Expected slow-drip sockets to hang; server closed all sockets early "
+                f"(avg {avg_closed:.2f}s)."
             )
     else:
-        if not hung:
+        # 1. Assert exactly 5 excess sockets rejected with 503
+        if count_503 == 5 and acquired_count == 30:
             log_pass(
-                f"Mitigation holds: server terminated slow-drip connection after "
-                f"{closed_at:.2f}s (within ABSOLUTE_REQUEST_TIMEOUT={ABS_DEADLINE}s "
-                f"+ grace={GRACE}s)."
+                f"Pool bounding holds: exactly {count_503} excess connections rejected with "
+                "HTTP 503, exactly 30 acquired pool slots."
             )
         else:
             log_fail(
-                f"ABSOLUTE_REQUEST_TIMEOUT NOT enforced: slow-drip connection "
-                f"stayed open beyond {ABS_DEADLINE + GRACE}s. "
-                "Idle timeout alone is insufficient against slow-drip attacks."
+                f"Expected exactly 5 excess connections rejected with 503; got {count_503} "
+                f"(acquired={acquired_count})."
             )
+
+        # 2. Assert all 30 slow-drip sockets terminated by deadline
+        if hung_slow == 0 and terminated_slow == 30:
+            log_pass(
+                f"Mitigation holds: all {acquired_count} acquired slow-drip sockets terminated within "
+                f"ABSOLUTE_REQUEST_TIMEOUT + grace (avg {avg_closed:.2f}s <= {CUTOFF:.1f}s)."
+            )
+        else:
+            log_fail(
+                f"ABSOLUTE_REQUEST_TIMEOUT NOT enforced: {hung_slow}/{acquired_count} "
+                f"slow-drip sockets hung beyond {CUTOFF:.1f}s."
+            )
+
+        # 3. Dispatch legitimate requests to verify server recovery and database atomicity
+        print(
+            f"  Dispatching {LEGIT_CLIENTS} concurrent legitimate POST /buy requests "
+            "after pool recovery...",
+            flush=True,
+        )
+
+        def legit_buy() -> tuple[int, float]:
+            t_start = time.monotonic()
+            try:
+                req = urllib.request.Request(f"{BASE}/buy", method="POST", data=b"")
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return (r.status, time.monotonic() - t_start)
+            except urllib.error.HTTPError as e:
+                return (e.code, time.monotonic() - t_start)
+            except Exception:
+                return (0, time.monotonic() - t_start)
+
+        with ThreadPoolExecutor(max_workers=LEGIT_CLIENTS) as pool:
+            futures = [pool.submit(legit_buy) for _ in range(LEGIT_CLIENTS)]
+            legit_results = [f.result() for f in as_completed(futures)]
+
+        legit_statuses = [st for st, _ in legit_results]
+        legit_max_time = max(dur for _, dur in legit_results)
+
+        print(
+            f"  Legitimate requests : {len(legit_statuses)} completed in max {legit_max_time:.2f}s "
+            f"(statuses: {sorted(legit_statuses)})",
+            flush=True,
+        )
+
+        if all(st == 200 for st in legit_statuses) and legit_max_time <= 1.0:
+            log_pass(
+                f"Transactional integrity holds: all {LEGIT_CLIENTS} legitimate requests returned HTTP 200 "
+                f"within {legit_max_time:.2f}s."
+            )
+        else:
+            log_fail(
+                f"Legitimate requests failed or slow: statuses={legit_statuses}, max_time={legit_max_time:.2f}s."
+            )
+
+        # 4. Assert database stock reflects exactly 5 purchases (remaining=5, sold=5)
+        conn = sqlite3.connect(db_file)
+        row = conn.execute("SELECT remaining, sold FROM stock WHERE id = 1;").fetchone()
+        conn.close()
+        remaining, sold = row[0], row[1]
+        print(f"  Final DB stock state: remaining={remaining}, sold={sold}", flush=True)
+
+        if remaining == 5 and sold == 5:
+            log_pass(
+                f"Database state verified: remaining={remaining}, sold={sold} (5 units successfully sold)."
+            )
+        else:
+            log_fail(
+                f"Database state mismatch: expected remaining=5, sold=5; got remaining={remaining}, sold={sold}."
+            )
+
+
+attack_b3 = attack_b3_slowloris_pool_exhaustion
 
 
 # ---------------------------------------------------------------------------
@@ -689,7 +802,9 @@ def main() -> None:
             target_module.init_db()
 
     print("Starting server...", flush=True)
-    server = ThreadingHTTPServer((HOST, PORT), HandlerClass)
+    class BoundThreadingHTTPServer(ThreadingHTTPServer):
+        request_queue_size = 128
+    server = BoundThreadingHTTPServer((HOST, PORT), HandlerClass)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     time.sleep(0.4)
@@ -700,7 +815,7 @@ def main() -> None:
         attack_b1_ingress_bounds(mode)
         attack_b1_chunked_streaming_exhaustion(mode)
         attack_b2(mode)
-        attack_b3(mode)
+        attack_b3_slowloris_pool_exhaustion(mode)
     finally:
         server.shutdown()
         print("\nServer stopped.", flush=True)

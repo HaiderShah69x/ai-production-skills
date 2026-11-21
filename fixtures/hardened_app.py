@@ -14,29 +14,42 @@ Implements all three invariants from skills/concurrency-and-resource-bounds/SKIL
       during chunked streaming reads; oversized payloads -> HTTP 413.
 
   Invariant 3 — Bounded Socket Lifecycles & Deadlines
+      MAX_CONCURRENT_CONNECTIONS = 30 bounded active connection pool semaphore.
+      Saturated pool immediately rejects with HTTP 503 {"error": "connection_pool_exhausted"}.
       READ_TIMEOUT = 2.0s idle timeout set on connection.
-      ABSOLUTE_REQUEST_TIMEOUT = 4.0s cumulative deadline to defeat slow data-drip attacks.
+      ABSOLUTE_REQUEST_TIMEOUT = 4.0s cumulative deadline to defeat Slowloris/slow-drip attacks.
 """
 
 import json
 import pathlib
 import socket
 import sqlite3
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # ---------------------------------------------------------------------------
 # Configuration constants (Invariant 2 + 3)
 # ---------------------------------------------------------------------------
-MAX_BODY_SIZE: int              = 1024 * 1024   # 1 MiB hard cap on every inbound body
-CHUNK_SIZE: int                 = 64 * 1024     # 64 KiB streaming read window
-READ_TIMEOUT: float             = 2.0           # seconds idle timeout on socket
-ABSOLUTE_REQUEST_TIMEOUT: float = 4.0           # absolute cumulative deadline for request
+MAX_BODY_SIZE: int                  = 1024 * 1024   # 1 MiB hard cap on every inbound body
+CHUNK_SIZE: int                     = 64 * 1024     # 64 KiB streaming read window
+READ_TIMEOUT: float                 = 2.0           # seconds idle timeout on socket
+ABSOLUTE_REQUEST_TIMEOUT: float     = 4.0           # absolute cumulative deadline for request
+MAX_CONCURRENT_CONNECTIONS: int     = 30            # global active connection pool limit
+CONNECTION_ACQUIRE_TIMEOUT: float   = 0.1           # bounded acquisition timeout for pool slot
 
 DB_PATH = pathlib.Path(__file__).parent / "store_hardened.db"
 
+CONNECTION_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_CONNECTIONS)
+
+
+def reset_connection_pool():
+    global CONNECTION_SEMAPHORE
+    CONNECTION_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_CONNECTIONS)
+
 
 def init_db():
+    reset_connection_pool()
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
@@ -59,12 +72,90 @@ def get_db():
 
 
 class HardenedHandler(BaseHTTPRequestHandler):
-    """HTTP request handler with database-level atomicity and resource limits."""
+    """HTTP request handler with database-level atomicity, connection pool bounding, and resource limits."""
 
     timeout: float = READ_TIMEOUT
+    acquired_slot: bool = False
 
     def log_message(self, format, *args):  # noqa: A002
         pass
+
+    def setup(self):
+        self.acquired_slot = False
+        try:
+            self.acquired_slot = CONNECTION_SEMAPHORE.acquire(
+                blocking=True, timeout=CONNECTION_ACQUIRE_TIMEOUT
+            )
+        except Exception:
+            self.acquired_slot = False
+
+        try:
+            super().setup()
+        except Exception:
+            if self.acquired_slot:
+                try:
+                    CONNECTION_SEMAPHORE.release()
+                except ValueError:
+                    pass
+                self.acquired_slot = False
+            raise
+
+        if self.acquired_slot:
+            # Enforce absolute request deadline on the raw connection
+            self.deadline_timer = threading.Timer(
+                ABSOLUTE_REQUEST_TIMEOUT, self._force_close_deadline
+            )
+            self.deadline_timer.daemon = True
+            self.deadline_timer.start()
+
+    def _force_close_deadline(self):
+        try:
+            self.connection.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            self.connection.close()
+        except Exception:
+            pass
+
+    def handle(self):
+        if not getattr(self, "acquired_slot", False):
+            try:
+                msg = (
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: 41\r\n"
+                    b"Connection: close\r\n"
+                    b"\r\n"
+                    b'{"error": "connection_pool_exhausted"}'
+                )
+                self.wfile.write(msg)
+                self.wfile.flush()
+                try:
+                    self.connection.shutdown(socket.SHUT_WR)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            self.close_connection = True
+            return
+        super().handle()
+
+    def finish(self):
+        if hasattr(self, "deadline_timer"):
+            try:
+                self.deadline_timer.cancel()
+            except Exception:
+                pass
+        try:
+            super().finish()
+        finally:
+            if getattr(self, "acquired_slot", False):
+                try:
+                    CONNECTION_SEMAPHORE.release()
+                except ValueError:
+                    pass
+                self.acquired_slot = False
 
     def do_GET(self):
         try:
@@ -80,7 +171,7 @@ class HardenedHandler(BaseHTTPRequestHandler):
                     conn.close()
             else:
                 self._json(404, {"error": "not found"})
-        except (socket.timeout, TimeoutError):
+        except (socket.timeout, TimeoutError, OSError):
             self._send_408()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
@@ -93,7 +184,7 @@ class HardenedHandler(BaseHTTPRequestHandler):
                 self._handle_upload()
             else:
                 self._json(404, {"error": "not found"})
-        except (socket.timeout, TimeoutError):
+        except (socket.timeout, TimeoutError, OSError):
             self._send_408()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
@@ -176,7 +267,7 @@ class HardenedHandler(BaseHTTPRequestHandler):
                     self._send_408()
                     return
                 raise
-            except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+            except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError):
                 return
 
             if not chunk:

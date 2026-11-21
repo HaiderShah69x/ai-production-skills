@@ -54,6 +54,13 @@ of concurrent callers.
   concurrent workers, it **must** be configured with Write-Ahead Logging (`PRAGMA journal_mode=WAL;`)
   and a non-zero busy timeout (`PRAGMA busy_timeout=5000;`) to avoid instantaneous `database is locked`
   failures during concurrent write contention.
+- **Explicit Worker Rejection Signals & Crash Prevention:** Concurrent callers that
+  fail to acquire a reservation (`cursor.rowcount == 0`) **MUST** receive an explicit,
+  deterministic rejection signal (e.g., HTTP 409 Conflict with `{"error": "out_of_stock"}`,
+  or domain `False`) rather than suffering unhandled database lock timeouts, silent drops,
+  or worker process termination crashes. Database engine exceptions (such as busy timeouts
+  or lock contention) must be caught explicitly and surfaced cleanly as structured transient
+  backoff responses (e.g., HTTP 503 / 429) rather than crashing the worker process.
 - **Quota Integrity vs Duplicate Submissions:** Atomicity guarantees quota and state
   integrity (e.g., never selling beyond 0 or double-spending), but does **not**
   prevent a user from intentionally or accidentally submitting duplicate requests.
@@ -114,14 +121,17 @@ No handler may read an unbounded amount of client-supplied data into memory.
 
 - **Define `MAX_BODY_SIZE` as a named constant** (not an inline magic number)
   at the module or configuration level.
-- **Reject oversized requests upfront.** If the `Content-Length` header is
-  present and exceeds `MAX_BODY_SIZE`, respond immediately with
-  **HTTP 413 Request Entity Too Large** before reading any body bytes.
+- **Reject oversized requests upfront with explicit HTTP 413.** If the `Content-Length` header is
+  present and exceeds `MAX_BODY_SIZE`, respond immediately with an RFC-compliant
+  **HTTP 413 Payload Too Large** response (`Connection: close`, flushed body) before reading any body bytes.
+  Do **NOT** drop or reset the socket with an unhandled TCP RST (status 0).
 - **Mandate incremental streaming byte-counting caps.** When `Content-Length` is
   absent, chunked (`Transfer-Encoding: chunked`), or streaming/decompressed (e.g., gzip/zlib bombs),
   the handler **must** maintain a running byte counter during chunked reads.
-  The stream must be aborted immediately with HTTP 413 the instant accumulated
+  The stream must be aborted immediately with an explicit **HTTP 413** response and flushed buffer the instant accumulated
   bytes exceed `MAX_BODY_SIZE`.
+- **Strict RFC Compliance Over Raw Resets:** Both declared Content-Length overflows and unannounced
+  chunked stream exhaustion **MUST** yield an explicit HTTP 413 response rather than an unhandled TCP RST (status 0).
 - **Forbid unbounded `.read()` / `ioutil.ReadAll` / `body.text()` calls.**
   Any call that reads an entire body into RAM without an explicit size cap is a
   critical production defect.
@@ -224,11 +234,11 @@ Send **N concurrent requests** that each attempt to consume from a quota of
 - Exactly N − Q requests are rejected (e.g., HTTP 409 / 429 / 402).
 - Final stored value equals 0 (fully consumed but never negative).
 
-### 2. Oversized Payload Test
+### 2. Oversized Payload & Chunked Stream Test
 
-Send a request with a body exceeding `MAX_BODY_SIZE`. Assert:
-
-- The server responds with **HTTP 413** or resets connection upfront.
+Send requests exceeding `MAX_BODY_SIZE`:
+- **Declared Content-Length Overflows:** Send a request declaring Content-Length > `MAX_BODY_SIZE`. Assert the server responds with **HTTP 413** (status 0 / connection reset is rejected as a test failure).
+- **Chunked Ingress Exhaustion:** Send an unannounced chunked stream (`Transfer-Encoding: chunked`) exceeding `MAX_BODY_SIZE`. Assert the server enforces the rolling byte cap, terminates ingestion, and responds with **HTTP 413**.
 - The server does **not** read beyond `MAX_BODY_SIZE` into memory.
 - The server does **not** crash or hang.
 

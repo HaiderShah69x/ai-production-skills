@@ -102,24 +102,30 @@ class HardenedHandler(BaseHTTPRequestHandler):
     # POST /buy — Invariant 1: atomic database reservation
     # ------------------------------------------------------------------
     def _handle_buy(self) -> None:
-        conn = get_db()
-        acquired = False
+        conn = None
         try:
-            with conn:
-                cursor = conn.execute(
-                    "UPDATE stock SET remaining = remaining - 1, sold = sold + 1 WHERE id = 1 AND remaining > 0;"
-                )
-                if cursor.rowcount == 1:
-                    acquired = True
+            conn = get_db()
+            cursor = conn.execute(
+                "UPDATE stock SET remaining = remaining - 1, sold = sold + 1 WHERE id = 1 AND remaining > 0;"
+            )
+            if cursor.rowcount == 1:
+                conn.commit()
+                # Downstream I/O simulation outside database lock/transaction
+                time.sleep(0.005)
+                self._json(200, {"status": "purchased"})
+            else:
+                conn.rollback()
+                self._json(409, {"error": "out_of_stock"})
+        except sqlite3.OperationalError as exc:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            self._json(503, {"error": "database_busy", "detail": str(exc)})
         finally:
-            conn.close()
-
-        if acquired:
-            # Downstream I/O simulation outside database lock/transaction
-            time.sleep(0.005)
-            self._json(200, {"ok": True})
-        else:
-            self._json(409, {"error": "sold out"})
+            if conn:
+                conn.close()
 
     # ------------------------------------------------------------------
     # POST /upload — Invariant 2 & 3: bounded streaming read & deadline
@@ -129,17 +135,20 @@ class HardenedHandler(BaseHTTPRequestHandler):
 
         raw_cl = self.headers.get("Content-Length")
         expected_len = None
+
         if raw_cl is not None:
             try:
                 expected_len = int(raw_cl)
                 if expected_len > MAX_BODY_SIZE:
-                    self._json(413, {"error": "payload too large"})
+                    self._send_413()
                     return
             except ValueError:
                 self._json(400, {"error": "invalid content-length"})
                 return
 
-        buf = bytearray()
+        # Ingress Stream / Chunked Protection:
+        # Read the ingress socket stream in chunks with a rolling byte counter.
+        # If cumulative received bytes exceed MAX_BODY_SIZE, immediately flush HTTP 413 and close.
         total_read = 0
 
         while True:
@@ -156,9 +165,9 @@ class HardenedHandler(BaseHTTPRequestHandler):
                 bytes_left = expected_len - total_read
                 if bytes_left <= 0:
                     break
-                want = min(CHUNK_SIZE, bytes_left, MAX_BODY_SIZE - total_read + 1)
+                want = min(CHUNK_SIZE, bytes_left)
             else:
-                want = min(CHUNK_SIZE, MAX_BODY_SIZE - total_read + 1)
+                want = CHUNK_SIZE
 
             try:
                 chunk = self.connection.recv(want)
@@ -167,21 +176,39 @@ class HardenedHandler(BaseHTTPRequestHandler):
                     self._send_408()
                     return
                 raise
+            except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+                return
 
             if not chunk:
                 break
 
-            buf.extend(chunk)
             total_read += len(chunk)
 
             if total_read > MAX_BODY_SIZE:
-                self._json(413, {"error": "payload too large"})
+                self._send_413()
                 return
 
             if expected_len is not None and total_read >= expected_len:
                 break
 
         self._json(200, {"bytes_received": total_read})
+
+    def _send_413(self) -> None:
+        try:
+            self.send_response(413)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b'{"error": "payload_too_large", "max_bytes": 1048576}')
+            self.wfile.flush()
+        except Exception:
+            pass
+        finally:
+            self.close_connection = True
+            try:
+                self.connection.close()
+            except Exception:
+                pass
 
     def _json(self, status: int, body: dict) -> None:
         payload = json.dumps(body).encode()

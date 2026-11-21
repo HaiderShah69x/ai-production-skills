@@ -72,7 +72,7 @@ class VulnerableHandler(BaseHTTPRequestHandler):
         try:
             row = conn.execute("SELECT remaining, sold FROM stock WHERE id = 1;").fetchone()
             if not row or row["remaining"] <= 0:
-                self._json(409, {"error": "sold out"})
+                self._json(409, {"error": "out_of_stock"})
                 return
 
             remaining = row["remaining"]
@@ -87,14 +87,26 @@ class VulnerableHandler(BaseHTTPRequestHandler):
                     "UPDATE stock SET remaining = ?, sold = ? WHERE id = 1;",
                     (remaining - 1, sold + 1),
                 )
-            self._json(200, {"ok": True})
+            self._json(200, {"status": "purchased"})
         finally:
             conn.close()
 
     def _handle_upload(self):
         # FLAW 2: unbounded payload read, no size limits or timeouts
-        length = int(self.headers.get("Content-Length", 0))
-        data = self.rfile.read(length)
+        raw_cl = self.headers.get("Content-Length")
+        if raw_cl is not None:
+            length = int(raw_cl)
+            data = self.rfile.read(length)
+        else:
+            # Unbounded chunked streaming read without size limit
+            data = bytearray()
+            while True:
+                chunk = self.connection.recv(65536)
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if b"0\r\n\r\n" in chunk:
+                    break
         self._json(200, {"bytes_received": len(data)})
 
     def _json(self, status: int, body: dict):

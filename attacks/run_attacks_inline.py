@@ -27,6 +27,8 @@ import argparse
 import importlib.util
 import json
 import pathlib
+import re
+import select
 import socket
 import sys
 import threading
@@ -107,28 +109,41 @@ def attack_a(mode: str) -> None:
         flush=True,
     )
 
-    def buy() -> int:
+    def buy() -> tuple[int, bool]:
+        """Returns (status_code, crashed: bool)."""
         try:
             req = urllib.request.Request(f"{BASE}/buy", method="POST", data=b"")
             with urllib.request.urlopen(req, timeout=10) as r:
-                return r.status
+                return (r.status, False)
         except urllib.error.HTTPError as e:
-            return e.code
+            is_crash = e.code >= 500
+            return (e.code, is_crash)
         except Exception:
-            return 0
+            return (0, True)
 
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        statuses = [
+        results = [
             f.result()
             for f in as_completed([pool.submit(buy) for _ in range(CONCURRENCY)])
         ]
 
-    successes  = statuses.count(200)
+    statuses = [s for s, _ in results]
+    crashes = sum(1 for _, c in results if c)
+    successes = statuses.count(200)
+    out_of_stock = statuses.count(409)
+
+    print("\n  Worker Outcome Distribution:", flush=True)
+    print(f"    - Success (200)             : {successes}", flush=True)
+    print(f"    - Out of Stock (409)        : {out_of_stock}", flush=True)
+    print(f"    - Unhandled Crashes (500/Ex): {crashes}", flush=True)
+
     stock_data = json.loads(urllib.request.urlopen(f"{BASE}/stock", timeout=5).read())
     remaining  = stock_data["remaining"]
+    sold       = stock_data.get("sold", QUOTA - remaining)
 
-    print(f"  Successful purchases : {successes}  (expected exactly {QUOTA})", flush=True)
-    print(f"  Stock remaining      : {remaining}  (expected 0)", flush=True)
+    print(f"\n  Final Database State:", flush=True)
+    print(f"    - Sold                     : {sold}  (expected {QUOTA})", flush=True)
+    print(f"    - Remaining                : {remaining}  (expected 0)", flush=True)
 
     if mode == "vulnerable":
         # Confirm the race fires
@@ -147,55 +162,125 @@ def attack_a(mode: str) -> None:
         else:
             log_fail(f"Stock was not oversold; got {remaining}.")
     else:
-        # Confirm the fix holds
+        # Confirm the fix holds with strict assertions:
+        # 1. Zero unhandled worker crashes: crash_count == 0
+        if crashes == 0:
+            log_pass(f"Zero unhandled worker crashes: crash_count == 0 ({crashes} crashes).")
+        else:
+            log_fail(f"Detected {crashes} worker crashes or unhandled server exceptions.")
+
+        # 2. Exact success quota: exactly 5 workers returned HTTP 200
         if successes == QUOTA:
-            log_pass(f"Exactly {QUOTA} purchases succeeded — atomicity holds.")
-        elif successes > QUOTA:
-            log_fail(
-                f"Race NOT fixed: {successes} purchases succeeded against quota "
-                f"of {QUOTA} (lost-update still present)."
-            )
+            log_pass(f"Exact success quota: exactly {QUOTA} workers returned HTTP 200.")
         else:
-            log_fail(
-                f"Only {successes} purchases succeeded (expected {QUOTA}). "
-                "Lock may be held too long or server is unstable."
-            )
-        if remaining == 0:
-            log_pass("Stock is exactly 0 — fully consumed, never negative.")
-        elif remaining < 0:
-            log_fail(f"Stock went negative ({remaining}) — atomicity broken.")
+            log_fail(f"Success quota breached: expected {QUOTA} HTTP 200, got {successes}.")
+
+        # 3. Exact bounded rejection quota: exactly 45 workers returned HTTP 409 (Out of Stock)
+        expected_rejections = CONCURRENCY - QUOTA
+        if out_of_stock == expected_rejections:
+            log_pass(f"Exact bounded rejection quota: exactly {expected_rejections} workers returned HTTP 409 (Out of Stock).")
         else:
-            log_fail(f"Stock is {remaining} (expected 0) — not all quota consumed.")
+            log_fail(f"Rejection quota mismatch: expected {expected_rejections} HTTP 409, got {out_of_stock}.")
+
+        # 4. Database state: sold == 5 and remaining == 0
+        if sold == QUOTA and remaining == 0:
+            log_pass(f"Database state verified: sold == {QUOTA} and remaining == 0.")
+        else:
+            log_fail(f"Database state invalid: sold={sold} (expected {QUOTA}), remaining={remaining} (expected 0).")
 
 
 # ---------------------------------------------------------------------------
-# Attack B1 — oversized payload
+# Raw HTTP socket helper
 # ---------------------------------------------------------------------------
-def attack_b1(mode: str) -> None:
+def send_raw_http(raw_header: bytes, body_chunks: list[bytes] = None) -> tuple[int, bytes]:
+    """
+    Connect via raw TCP, send HTTP headers and body chunks, and read the response.
+    Returns (status_code, response_bytes). If connection is reset or dropped without
+    HTTP response, status_code is 0.
+    """
+    sock = None
+    try:
+        sock = socket.create_connection((HOST, PORT), timeout=10)
+        sock.sendall(raw_header)
+
+        resp = b""
+
+        if body_chunks:
+            # Check if server sent an immediate response (e.g. upfront 413 rejection on headers)
+            r, _, _ = select.select([sock], [], [], 0.1)
+            if r:
+                while True:
+                    try:
+                        sock.settimeout(1.0)
+                        data = sock.recv(4096)
+                        if not data:
+                            break
+                        resp += data
+                    except Exception:
+                        break
+            else:
+                sock.settimeout(2.0)
+                for chunk in body_chunks:
+                    try:
+                        sock.sendall(chunk)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        break
+                    r, _, _ = select.select([sock], [], [], 0)
+                    if r:
+                        break
+
+        # Read any remaining response bytes
+        if not resp:
+            sock.settimeout(5.0)
+            while True:
+                try:
+                    data = sock.recv(4096)
+                    if not data:
+                        break
+                    resp += data
+                except Exception:
+                    break
+
+        # Extract HTTP status code
+        if resp:
+            m = re.search(r"HTTP/\d\.\d\s+(\d+)", resp.decode("latin1", errors="ignore"))
+            if m:
+                return (int(m.group(1)), resp)
+        return (0, resp)
+    except Exception:
+        return (0, b"")
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Attack B1 — oversized payload (Content-Length declared)
+# ---------------------------------------------------------------------------
+def attack_b1_ingress_bounds(mode: str) -> None:
     header("Attack B1: Ingress Resource Bounds — 10 MB POST /upload")
 
     PAYLOAD_MB    = 10
     payload_bytes = PAYLOAD_MB * 1024 * 1024
     print(f"  Target : {mode}  |  Payload={PAYLOAD_MB} MB", flush=True)
 
-    status = -1
-    try:
-        data = b"\x00" * payload_bytes
-        req  = urllib.request.Request(
-            f"{BASE}/upload",
-            method="POST",
-            data=data,
-            headers={"Content-Type": "application/octet-stream"},
-        )
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            status = resp.status
-    except urllib.error.HTTPError as e:
-        status = e.code
-    except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
-        status = 0   # connection reset — equivalent to 000
-    except Exception as exc:
-        status = 0
-        print(f"  (exception: {exc})", flush=True)
+    raw_header = (
+        f"POST /upload HTTP/1.1\r\n"
+        f"Host: {HOST}:{PORT}\r\n"
+        f"Content-Length: {payload_bytes}\r\n"
+        f"Content-Type: application/octet-stream\r\n"
+        f"Connection: close\r\n"
+        f"\r\n"
+    ).encode()
+
+    chunk = b"\x00" * (64 * 1024)
+    num_chunks = payload_bytes // len(chunk)
+    body_chunks = [chunk for _ in range(num_chunks)]
+
+    status, resp = send_raw_http(raw_header, body_chunks)
 
     print(
         f"  HTTP status received  : {status}  "
@@ -218,17 +303,78 @@ def attack_b1(mode: str) -> None:
         if status == 413:
             log_pass(
                 f"Mitigation holds: oversized {PAYLOAD_MB} MB payload rejected "
-                f"with HTTP 413."
+                f"with RFC-compliant HTTP 413."
             )
         elif status == 0:
-            log_pass(
-                "Mitigation holds: server reset connection on oversized payload "
-                "(connection reset / 000)."
+            log_fail(
+                "Mitigation failed: server dropped/reset connection (status 0); "
+                "expected clean HTTP 413 RFC compliance."
             )
         else:
             log_fail(
                 f"Expected HTTP 413 for oversized payload; got {status}. "
                 "MAX_BODY_SIZE guard missing or not enforced."
+            )
+
+
+attack_b1 = attack_b1_ingress_bounds
+
+
+# ---------------------------------------------------------------------------
+# Attack B1 (Chunked) — chunked streaming exhaustion (no Content-Length)
+# ---------------------------------------------------------------------------
+def attack_b1_chunked_streaming_exhaustion(mode: str) -> None:
+    header("Attack B1 (Chunked): Streaming Ingress Exhaustion (POST /upload)")
+
+    STREAM_MB = 1.25  # Exceeds 1 MB cap
+    print(f"  Target : {mode}  |  Chunked stream={STREAM_MB} MB (no Content-Length)", flush=True)
+
+    raw_header = (
+        f"POST /upload HTTP/1.1\r\n"
+        f"Host: {HOST}:{PORT}\r\n"
+        f"Transfer-Encoding: chunked\r\n"
+        f"Content-Type: application/octet-stream\r\n"
+        f"Connection: close\r\n"
+        f"\r\n"
+    ).encode()
+
+    chunk_payload = b"X" * (64 * 1024)  # 64 KB
+    chunk_line = f"{len(chunk_payload):x}\r\n".encode() + chunk_payload + b"\r\n"
+    # 20 chunks * 64 KB = 1,280 KB = 1.25 MB
+    chunks = [chunk_line for _ in range(20)] + [b"0\r\n\r\n"]
+
+    status, resp = send_raw_http(raw_header, chunks)
+
+    print(
+        f"  HTTP status received  : {status}  "
+        f"({'expected 413' if mode == 'hardened' else 'expected 200'})",
+        flush=True,
+    )
+
+    if mode == "vulnerable":
+        if status == 200:
+            log_pass(
+                f"Vulnerability confirmed: app ingested {STREAM_MB} MB chunked stream "
+                "without memory bounds (status=200)."
+            )
+        else:
+            log_fail(
+                f"Expected 200 on vulnerable target; got {status}."
+            )
+    else:
+        if status == 413:
+            log_pass(
+                f"Mitigation holds: unannounced chunked stream exceeding 1 MB rejected "
+                "with RFC-compliant HTTP 413."
+            )
+        elif status == 0:
+            log_fail(
+                "Mitigation failed: server dropped/reset connection (status 0); "
+                "expected clean HTTP 413 RFC compliance."
+            )
+        else:
+            log_fail(
+                f"Expected HTTP 413 for chunked streaming exhaustion; got {status}."
             )
 
 
@@ -519,7 +665,8 @@ def main() -> None:
 
     try:
         attack_a(mode)
-        attack_b1(mode)
+        attack_b1_ingress_bounds(mode)
+        attack_b1_chunked_streaming_exhaustion(mode)
         attack_b2(mode)
         attack_b3(mode)
     finally:

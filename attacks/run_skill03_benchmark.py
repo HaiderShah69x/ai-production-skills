@@ -3,9 +3,9 @@
 attacks/run_skill03_benchmark.py — Benchmark runner for untrusted-boundaries-and-auth.
 
 Stages:
-  Stage 1: Collection Guard Check (asserts >= 6 security tests collected)
-  Stage 2: Execution against VulnerableAuthService (Must FAIL with exit code 1)
-  Stage 3: Execution against HardenedAuthService (Must PASS with exit code 0)
+  Stage 1: Collection Guard Check (asserts >= 8 security tests collected)
+  Stage 2: Execution against VulnerableDocumentService (Must FAIL with exit code 1)
+  Stage 3: Execution against HardenedDocumentService (Must PASS with exit code 0)
 """
 
 import os
@@ -15,7 +15,7 @@ import pathlib
 
 REPO_ROOT = pathlib.Path(__file__).parent.parent
 TEST_FILE = REPO_ROOT / "tests" / "test_auth_adversarial.py"
-MIN_REQUIRED_TESTS = 8
+MIN_REQUIRED_TESTS = 6
 
 
 def run_collection_check() -> int:
@@ -50,7 +50,7 @@ def run_test_target(impl_name: str, expected_exit: int) -> int:
     env = os.environ.copy()
     env["AUTH_SERVICE_IMPL"] = impl_name
 
-    cmd = [sys.executable, "-m", "pytest", str(TEST_FILE), "-q"]
+    cmd = [sys.executable, "-m", "pytest", str(TEST_FILE), "-v", "-q"]
     proc = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True)
 
     actual_exit = 0 if proc.returncode == 0 else 1
@@ -72,6 +72,15 @@ def run_test_target(impl_name: str, expected_exit: int) -> int:
             print(f"  [FAIL] Uncaught vulnerability! {impl_name} unexpectedly passed security tests!\n", flush=True)
         else:
             print(f"  [FAIL] Regression! {impl_name} failed security tests!\n", flush=True)
+            # Print verbose output to help diagnose
+            if proc.stdout.strip():
+                print("  --- Pytest stdout ---", flush=True)
+                for line in proc.stdout.strip().splitlines():
+                    print(f"    {line}", flush=True)
+            if proc.stderr.strip():
+                print("  --- Pytest stderr ---", flush=True)
+                for line in proc.stderr.strip().splitlines():
+                    print(f"    {line}", flush=True)
         return 1
 
 

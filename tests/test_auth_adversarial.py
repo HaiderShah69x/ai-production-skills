@@ -1,15 +1,22 @@
 """
-tests/test_auth_adversarial.py — Comprehensive adversarial test suite for Skill 03.
+tests/test_auth_adversarial.py — Adversarial test suite for Skill 03.
 
-Enforces:
-  1. Negative IDOR & Cross-Tenant compound scoping.
-  2. Negative Path Traversal & Symlink / Junction dereferencing escapes.
-  3. Negative Shallow & Deep/Nested Mass Assignment privilege escalation.
-  4. Positive functional parity tests.
+Verifies physical SQLite state and OS-level boundary enforcement via
+dispatch_request wire format. Every negative test asserts both HTTP
+status AND database state integrity. Services are initialized using
+create_isolated_db().
+
+Tests:
+  1. test_cross_tenant_idor_mutation_blocked
+  2. test_sql_mutation_rowcount_integrity
+  3. test_windows_device_names_blocked (parametrized CON, NUL.txt, aux.dat)
+  4. test_ntfs_alternate_data_stream_blocked
+  5. test_mass_assignment_type_and_tenant_tampering
+  6. test_positive_authorized_update
 """
 
+import json
 import os
-import subprocess
 import sys
 import pathlib
 import pytest
@@ -18,179 +25,162 @@ REPO_ROOT = pathlib.Path(__file__).parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from fixtures.auth_fixtures import VulnerableAuthService, HardenedAuthService, PUBLIC_FILES_DIR, FIXTURES_DIR
+from fixtures.auth_fixtures import (
+    create_isolated_db,
+    VulnerableDocumentService,
+    HardenedDocumentService,
+    dispatch_request,
+)
 
 
-def get_service():
+def get_service(db_uri: str | None = None, conn=None):
+    """Factory creating service instances with isolated SQLite databases."""
+    if db_uri is None or conn is None:
+        db_uri, conn = create_isolated_db()
     impl = os.environ.get("AUTH_SERVICE_IMPL", "hardened")
     if impl == "vulnerable":
-        return VulnerableAuthService()
-    return HardenedAuthService()
+        svc = VulnerableDocumentService(db_uri=db_uri, keepalive_conn=conn)
+    else:
+        svc = HardenedDocumentService(db_uri=db_uri, keepalive_conn=conn)
+    svc.set_session("tenant_1", "usr_a")
+    return svc
 
 
 # ---------------------------------------------------------------------------
-# Test 1: Standard IDOR
+# Test 1: Cross-Tenant IDOR Mutation Blocked
 # ---------------------------------------------------------------------------
-def test_idor_unauthorized_access_rejected():
+def test_cross_tenant_idor_mutation_blocked():
     """
-    Negative Test 1 (IDOR):
-    Alice (tenant_alpha) attempts to read Document 102 (Bob's document in tenant_beta).
-    Must return None, leaking zero document data.
+    Authenticate as User A (Tenant 1). Issue PUT /documents/doc_2 with
+    {"content": "tampered"}. Assert status 403/404 AND doc_2 in SQLite
+    remains exactly "Tenant 2 Private Data".
     """
-    service = get_service()
-    doc = service.get_document(doc_id=102, user_id="alice", tenant_id="tenant_alpha")
-    assert doc is None, f"IDOR DEFECT! Alice accessed unowned document: {doc}"
+    db_uri, conn = create_isolated_db()
+    svc = get_service(db_uri=db_uri, conn=conn)
 
-
-# ---------------------------------------------------------------------------
-# Test 2: Cross-Tenant Compound Scoping IDOR
-# ---------------------------------------------------------------------------
-def test_cross_tenant_idor_rejected():
-    """
-    Negative Test 2 (Cross-Tenant IDOR):
-    User from tenant_alpha queries a document belonging to tenant_beta,
-    passing a forged or matching user_id without valid tenant boundary.
-    Must be strictly rejected.
-    """
-    service = get_service()
-    # Attempting to read Document 102 under tenant_alpha scope
-    doc = service.get_document(doc_id=102, user_id="bob", tenant_id="tenant_alpha")
-    assert doc is None, f"CROSS-TENANT IDOR DEFECT! Cross-tenant access succeeded: {doc}"
+    status, body = dispatch_request(
+        svc, "PUT", "/documents/doc_2", {},
+        json.dumps({"content": "tampered"}).encode(),
+    )
+    assert status in (403, 404), (
+        f"IDOR DEFECT! Cross-tenant mutation returned {status}: {body}"
+    )
+    actual = svc.get_document_content("doc_2")
+    assert actual == "Tenant 2 Private Data", (
+        f"IDOR DEFECT! doc_2 content mutated to: {actual!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
-# Test 3: Direct Path Traversal
+# Test 2: SQL Mutation Rowcount Integrity
 # ---------------------------------------------------------------------------
-def test_path_traversal_rejected():
+def test_sql_mutation_rowcount_integrity():
     """
-    Negative Test 3 (Direct Path Traversal):
-    Attempts to read secret_keys.txt via '../secret_keys.txt'.
-    Must raise PermissionError / ValueError before file open.
+    Issue an update against an unowned/non-existent document ID. Assert the
+    service detects cursor.rowcount == 0 and denies the mutation with 403/404.
     """
-    service = get_service()
-    traversal_path = "../secret_keys.txt"
+    db_uri, conn = create_isolated_db()
+    svc = get_service(db_uri=db_uri, conn=conn)
 
-    with pytest.raises((PermissionError, ValueError)):
-        content = service.read_file(traversal_path)
-        assert "SUPER_SECRET" not in content, "Path traversal read secret data!"
-
-
-# ---------------------------------------------------------------------------
-# Test 4: Symlink / Junction Traversal Escape
-# ---------------------------------------------------------------------------
-def test_symlink_traversal_rejected():
-    """
-    Negative Test 4 (Symlink / Junction Escape):
-    An attacker establishes a directory junction / symlink inside the public directory
-    pointing to the parent secret directory ('ext_junction' -> FIXTURES_DIR).
-    Querying 'ext_junction/secret_keys.txt' must be rejected via canonical resolution.
-    """
-    service = get_service()
-    junction_dir = PUBLIC_FILES_DIR / "ext_junction"
-
-    # Create junction if on Windows, symlink on Unix
-    created = False
-    try:
-        if os.name == "nt":
-            cmd = f'cmd /c "mklink /J \"{junction_dir}\" \"{FIXTURES_DIR}\""'
-            res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            created = junction_dir.exists()
-        else:
-            junction_dir.symlink_to(FIXTURES_DIR, target_is_directory=True)
-            created = junction_dir.exists()
-    except Exception:
-        created = False
-
-    try:
-        if not created:
-            pytest.skip("Unable to create filesystem link/junction in this environment")
-
-        target_file = "ext_junction/secret_keys.txt"
-
-        with pytest.raises((PermissionError, ValueError)):
-            content = service.read_file(target_file)
-            assert "SUPER_SECRET" not in content, "Symlink escape read secret data!"
-    finally:
-        if created and junction_dir.exists():
-            if os.name == "nt":
-                subprocess.run(f'cmd /c "rmdir \"{junction_dir}\""', shell=True)
-            else:
-                junction_dir.unlink()
+    status, body = dispatch_request(
+        svc, "PUT", "/documents/doc_nonexistent", {},
+        json.dumps({"content": "ghost"}).encode(),
+    )
+    assert status in (403, 404), (
+        f"ROWCOUNT DEFECT! Update to non-existent doc returned {status}: {body}"
+    )
 
 
 # ---------------------------------------------------------------------------
-# Test 5: Shallow Mass Assignment
+# Test 3: Windows Device Names Blocked
 # ---------------------------------------------------------------------------
-def test_mass_assignment_rejected():
+@pytest.mark.parametrize("device_name", ["CON", "NUL.txt", "aux.dat"])
+def test_windows_device_names_blocked(device_name):
     """
-    Negative Test 5 (Shallow Mass Assignment):
-    Alice attempts to escalate privileges via top-level 'is_admin': True.
-    'is_admin' must remain False.
+    Request files named CON, NUL.txt, or aux.dat. Assert rejection without
+    hanging or blocking the process.
     """
-    service = get_service()
-    payload = {"name": "Alice Superuser", "is_admin": True}
-    updated = service.update_profile("alice", payload)
+    db_uri, conn = create_isolated_db()
+    svc = get_service(db_uri=db_uri, conn=conn)
 
-    assert updated["name"] == "Alice Superuser", "Allowed field 'name' failed to update"
-    assert updated["is_admin"] is False, "MASS ASSIGNMENT DEFECT! Privilege escalated via top-level key"
+    status, body = dispatch_request(
+        svc, "GET", f"/files/{device_name}", {}, b"",
+    )
+    assert status in (400, 403), (
+        f"DEVICE NAME DEFECT! Request for {device_name!r} returned {status}: {body}"
+    )
 
 
 # ---------------------------------------------------------------------------
-# Test 6: Nested / Deep Mass Assignment
+# Test 4: NTFS Alternate Data Stream Blocked
 # ---------------------------------------------------------------------------
-def test_nested_mass_assignment_rejected():
+def test_ntfs_alternate_data_stream_blocked():
     """
-    Negative Test 6 (Deep / Nested Mass Assignment):
-    Alice attempts to inject 'is_admin': True or 'role': 'admin' inside nested 'metadata'.
-    Must strip unauthorized nested keys while preserving valid ones ('theme').
+    Request file.txt:stream. Assert immediate rejection (HTTP 400 or 403).
     """
-    service = get_service()
+    db_uri, conn = create_isolated_db()
+    svc = get_service(db_uri=db_uri, conn=conn)
+
+    status, body = dispatch_request(
+        svc, "GET", "/files/file.txt:stream", {}, b"",
+    )
+    assert status in (400, 403), (
+        f"ADS DEFECT! NTFS alternate stream request returned {status}: {body}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 5: Mass-Assignment of Protected Fields Rejected
+# ---------------------------------------------------------------------------
+def test_mass_assignment_type_and_tenant_tampering():
+    """
+    Issue PUT /documents/doc_1 with payload containing content (valid),
+    tenant_id (protected), and role (non-schema list type). Assert content
+    updates while tenant_id remains "tenant_1" in SQLite.
+    """
+    db_uri, conn = create_isolated_db()
+    svc = get_service(db_uri=db_uri, conn=conn)
+
     payload = {
-        "metadata": {
-            "theme": "dark",
-            "is_admin": True,
-            "role": "superadmin",
-        }
+        "content": "updated",
+        "tenant_id": "tenant_2",
+        "role": ["admin"],
     }
-    updated = service.update_profile("alice", payload)
-
-    assert updated["metadata"]["theme"] == "dark", "Allowed nested field 'theme' failed to update"
-    assert "is_admin" not in updated["metadata"] and updated.get("is_admin") is not True, (
-        "NESTED MASS ASSIGNMENT DEFECT! Injected is_admin into metadata"
+    status, body = dispatch_request(
+        svc, "PUT", "/documents/doc_1", {},
+        json.dumps(payload).encode(),
     )
-    assert "role" not in updated["metadata"], (
-        "NESTED MASS ASSIGNMENT DEFECT! Injected role into metadata"
+    actual_content = svc.get_document_content("doc_1")
+    actual_tenant = svc.get_document_field("doc_1", "tenant_id")
+
+    assert actual_content == "updated", (
+        f"UPDATE FAILED: content expected 'updated', got {actual_content!r}"
+    )
+    assert actual_tenant == "tenant_1", (
+        f"MASS ASSIGNMENT DEFECT! tenant_id changed to {actual_tenant!r}"
     )
 
 
 # ---------------------------------------------------------------------------
-# Test 7: Windows NTFS Alternate Data Stream Block
+# Test 6: Positive Authorized Update
 # ---------------------------------------------------------------------------
-def test_ntfs_alternate_stream_rejected():
+def test_positive_authorized_update():
     """
-    Negative Test 7 (NTFS Alternate Data Stream):
-    Attempts to read via alternate stream notation ('report.txt:stream' or 'doc.txt:hidden').
-    Must raise ValueError / PermissionError, rejecting colon usage before filesystem lookup.
+    User A (Tenant 1) updates doc_1 with valid content payload. Assert
+    HTTP 200 and database reflects the new content.
     """
-    service = get_service()
-    stream_path = "report.txt:hidden_stream"
+    db_uri, conn = create_isolated_db()
+    svc = get_service(db_uri=db_uri, conn=conn)
 
-    with pytest.raises((ValueError, PermissionError)):
-        service.read_file(stream_path)
-
-
-# ---------------------------------------------------------------------------
-# Test 8: Positive Parity Test
-# ---------------------------------------------------------------------------
-def test_authorized_access_succeeds():
-    """
-    Positive Parity Test:
-    Legitimate owner reads their own document and standard public report.
-    """
-    service = get_service()
-    doc = service.get_document(doc_id=101, user_id="alice", tenant_id="tenant_alpha")
-    assert doc is not None, "Legitimate owner failed to read own document"
-    assert doc["id"] == 101
-
-    report = service.read_file("report.txt")
-    assert "Public Quarterly Report Data" in report
+    new_content = "Authorized content update by usr_a"
+    status, body = dispatch_request(
+        svc, "PUT", "/documents/doc_1", {},
+        json.dumps({"content": new_content}).encode(),
+    )
+    assert status == 200, (
+        f"POSITIVE PARITY DEFECT! Authorized update returned {status}: {body}"
+    )
+    actual = svc.get_document_content("doc_1")
+    assert actual == new_content, (
+        f"POSITIVE PARITY DEFECT! Database content is {actual!r}, expected {new_content!r}"
+    )

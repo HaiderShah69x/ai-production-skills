@@ -2,102 +2,103 @@
 name: untrusted-boundaries-and-auth
 description: >-
   Enforces object-level authorization (IDOR prevention), strict path boundary
-  containment with symlink dereferencing, and recursive input schema validation to
-  prevent privilege escalation and unauthorized file access. Use when writing resource
-  endpoints, document fetchers, file download/upload handlers, or user profile APIs.
+  containment with symlink dereferencing, Windows filesystem sanitization, and
+  strict input schema validation to prevent privilege escalation and unauthorized
+  file access. Use when writing resource endpoints, document fetchers, file
+  download/upload handlers, or user profile APIs.
 ---
 
 # Untrusted Boundaries and Auth
 
 ## Core Objective
 
-Eliminate perimeter and boundary blind spots in AI-generated code:
-1. **Broken Object-Level Authorization (IDOR) & Multi-Tenant Leaks:** Returning or modifying private records solely by record ID or single tenant key, allowing cross-tenant or cross-user data exposure.
-2. **Path Traversal & Symlink Escapes:** Naive path concatenation (`os.path.join`) or partial checks that allow `../` or symlinks/junctions pointing outside the base directory.
-3. **Shallow & Nested Mass-Assignment:** Binding raw client dictionaries or merging unvalidated nested objects into models, allowing callers to overwrite privileged attributes (`is_admin`, `role`, `tenant_id`, `balance`).
+Eliminate perimeter and boundary blind spots in AI-generated code by enforcing
+real database-level authorization, OS-level path containment, and strict schema
+allowlists — verified against physical SQLite state, not in-memory mocks.
+
+1. **Broken Object-Level Authorization (IDOR) & Multi-Tenant Leaks:** Mutating or returning private records solely by record ID without compound tenant + owner scoping in the SQL WHERE clause.
+2. **Path Traversal, Symlink Escapes & OS Edge Cases:** Naive path concatenation, unresolved symlinks/junctions, NTFS Alternate Data Streams, and Windows reserved device names bypassing boundary checks.
+3. **Mass-Assignment Privilege Escalation:** Binding raw client dictionaries into SQL UPDATE or model merge operations, allowing callers to overwrite `tenant_id`, `owner_id`, `role`, or inject arbitrary keys.
 
 ---
 
-## Invariant 1 — Mandatory Object-Level Authorization & Compound Scoping
+## Invariant 1 — Mandatory Compound SQL Scoping & Trusted Session Context
 
 ### Rule
-**Authentication is not authorization.** Every query that reads, updates, or deletes tenant- or user-scoped data **must** bind both the authenticated actor's ID and tenant ID directly in the retrieval query.
+**Authentication is not authorization.** Every SQL query that reads, updates, or deletes tenant- or user-scoped data **must** bind both `tenant_id` AND `owner_id` from the cryptographically verified session context directly in the WHERE clause.
 
 ### Requirements
-- **Trusted Context Only (Forgery Prevention):** The `tenant_id` and `user_id` bound into retrieval and mutation queries **MUST** originate strictly from the cryptographically verified session token, JWT claims, or mutual-TLS context (e.g. `auth_context.tenant_id`, `request.state.user.id`). It is **strictly forbidden** to accept or trust tenancy identifiers or actor IDs supplied via client query strings, JSON request bodies, form fields, or unverified custom headers (e.g. `X-Tenant-ID`), which invite trivial client-controlled tenancy forgery.
-- **Compound Scoping Required:** In multi-tenant systems, single-key lookups are defective. Every data access query must include compound filters:
+- **Trusted Context Only (Forgery Prevention):** The `tenant_id` and `user_id` bound into SQL queries **MUST** originate from the verified session/token context (e.g. `service.session_tenant_id`). It is **strictly forbidden** to read these values from client query strings, JSON request bodies, form fields, or unverified headers.
+- **Compound SQL Scoping:** Every mutation must enforce compound ownership at the database level:
   ```sql
-  SELECT * FROM documents
-  WHERE id = :doc_id
-    AND tenant_id = :authenticated_tenant_id
-    AND owner_id = :authenticated_user_id;
+  UPDATE documents SET content = ?
+  WHERE id = ? AND tenant_id = ? AND owner_id = ?;
   ```
-- **Uniform Rejection Without Leaks:** If the record does not exist or belongs to another tenant/user, return HTTP 404 (or 403 without metadata leaks). Never disclose whether a cross-tenant or foreign record ID exists.
-- **No In-Memory Post-Filtering:** Ownership checks must never be deferred to application memory after fetching un-scoped records from the database.
+- **Rowcount Verification:** After every mutation, verify `cursor.rowcount == 1`. If `rowcount == 0`, the record either does not exist or belongs to another tenant — rollback and return HTTP 404/403 without leaking record existence.
+- **No In-Memory Post-Filtering:** Ownership checks must occur inside the SQL WHERE clause, never deferred to application code after fetching un-scoped rows.
 
 ---
 
-## Invariant 2 — Strict Canonical Path Containment & Symlink Dereferencing
+## Invariant 2 — Strict Canonical Path Containment & OS Sanitization
 
 ### Rule
-Every filesystem path resolved from client-provided input **must** be canonically resolved—including full symlink and directory junction dereferencing—and asserted to reside within the intended base directory before touching file descriptors.
+Every filesystem path resolved from client input **must** be canonically resolved and asserted to reside strictly within the base directory. All OS-specific attack vectors must be blocked before path resolution.
 
 ### Requirements
-- **Dereference Canonical Target:** Always resolve the path completely before inspection:
+- **Block NTFS Alternate Data Streams:** Reject any filename containing `:` immediately (e.g. `file.txt:hidden`, `dir::$INDEX_ALLOCATION`).
+- **Block Windows Reserved Device Names:** Reject `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9` (case-insensitive check against the filename stem, with or without extension).
+- **Strip Trailing Dots and Whitespace:** Remove trailing `.` and spaces from each path component before evaluation (Windows silently strips these, creating bypass opportunities).
+- **Canonical Resolution & Containment:**
   ```python
   base = Path(BASE_DIR).resolve()
-  canonical_target = (base / user_filename).resolve()
+  canonical_target = (base / clean_name).resolve()
+  assert canonical_target.is_relative_to(base) and canonical_target != base
   ```
-- **Assert Containment (`is_relative_to`):** Verify `canonical_target.is_relative_to(base)`. If false, abort immediately with an error (e.g. `PermissionError`, HTTP 403 / 400).
-- **Symlink Boundary Checks:** If `user_filename` points to a symlink or junction, resolving it exposes the real target file. The real target file itself must reside inside `base`.
-- **Windows Path & NTFS Alternate Data Stream Sanitization:**
-  - Forbid `:` (colons) in client-supplied path components to block **NTFS Alternate Data Streams** (e.g. `report.txt:hidden_stream` or `dir::$INDEX_ALLOCATION`).
-  - Forbid Windows reserved device names (e.g. `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`).
-- **Forbid String Replacement:** Never rely on stripping `../`, regex sanitizers, or substring blacklists. Attackers easily bypass string filters via encoded slashes, backslashes, or null bytes (`\x00`).
+- **Symlink/Junction Dereferencing:** `resolve()` follows symlinks and junctions — the real target must reside inside `base`.
+- **Forbid String Replacement Sanitizers:** Never rely on stripping `../`, regex blacklists, or substring filters.
 
 ---
 
-## Invariant 3 — Recursive Schema Allowlisting (Nested Mass-Assignment Defense)
+## Invariant 3 — Strict Schema Allowlist (Mass-Assignment Defense)
 
 ### Rule
-All external client payloads (JSON, form data, nested dicts) **must** be filtered against an explicit, recursive allowlist schema before updating domain models or persistent stores.
+All client payloads **must** be filtered against an explicit schema allowlist before updating database records. Protected fields (`tenant_id`, `owner_id`, `id`, `role`) must never be writable from client input.
 
 ### Requirements
-- **Never Bind Raw or Shallow-Cleaned Dictionaries:** Forbid `model.update(request_data)`, shallow dictionary merges (`dict.update()`), or unpackings (`**data`).
-- **Recursive Allowlist Schema:** Define explicit structures matching nested objects and types:
+- **Explicit Field + Type Allowlist:**
   ```python
-  ALLOWED_SCHEMA = {
-      "name": str,
-      "email": str,
-      "metadata": {
-          "theme": str,
-          "notifications": bool,
-      },
+  ALLOWED_UPDATE_FIELDS = {
+      "title": str,
+      "content": str,
   }
   ```
-- **Strip or Reject Unauthorized Keys at Every Level:** Any attempt to provide unlisted keys at the root level (`is_admin`, `role`) or nested levels (`metadata.is_admin`, `metadata.role`) must be stripped or rejected with a validation error (HTTP 422/400).
+- **Drop or Reject Unauthorized Keys:** Any key not in the allowlist (including `tenant_id`, `owner_id`, `id`, `role`) must be silently dropped or rejected with HTTP 400/422.
+- **Type Enforcement:** Values must match the expected type. Non-string types (lists, dicts, integers) for string-typed fields must be rejected.
+- **Compound Scoping on Updates:** Even for allowed fields, the UPDATE query must include `AND tenant_id = ? AND owner_id = ?` to prevent cross-tenant writes.
 
 ---
 
 ## Verification Requirements
 
-The test suite must include negative verification for all critical boundary violations:
-1. **Standard IDOR:** Attempt to access User B's document using User A's credentials. Must return rejection and leak zero data.
-2. **Cross-Tenant IDOR:** User from Tenant A attempts to access Tenant B's document using a valid document ID under Tenant A's scope. Must be rejected.
-3. **Direct Path Traversal:** Accessing `../secret_keys.txt` must be rejected before opening the file.
-4. **Symlink / Junction Traversal:** Symlinks or junctions placed in public directories pointing to external targets must be rejected via canonical resolution.
-5. **Shallow Mass Assignment:** Top-level privilege injection (`{"is_admin": True}`) must be stripped or rejected.
-6. **Nested Mass Assignment:** Deep nested privilege injection (`{"metadata": {"is_admin": True}}`) must be stripped or rejected.
-7. **Positive Parity:** Legitimate users can access their own documents, read valid relative files, and update allowed profile fields.
+The test suite must verify physical database state through `dispatch_request` wire format:
+
+1. **Cross-Tenant IDOR Mutation:** User A (Tenant 1) issues `PUT /documents/doc_2`. Assert HTTP 403/404 AND doc_2 content in SQLite remains unchanged.
+2. **Rowcount Integrity:** Update a non-existent document ID. Assert HTTP 403/404 and zero state mutation.
+3. **Windows Device Names:** Request `CON`, `NUL.txt`, `aux.dat`. Assert rejection without process hang.
+4. **NTFS Alternate Data Stream:** Request `file.txt:stream`. Assert immediate rejection (HTTP 400/403).
+5. **Mass-Assignment Tampering:** PUT with `{"content": "valid", "tenant_id": "tenant_2", "role": ["admin"]}`. Assert content updates while tenant_id remains `"tenant_1"` in SQLite.
+6. **Positive Parity:** User A updates own doc_1 with valid payload. Assert HTTP 200 and database reflects new content.
 
 ---
 
 ## Checklist
 
-- [ ] Every user/tenant scoped query includes compound `tenant_id` AND `owner_id` in the `WHERE` clause.
-- [ ] No ownership checks deferred to application memory after fetching un-scoped records.
-- [ ] All file paths use `Path(...).resolve()` and `is_relative_to(base_dir)`.
-- [ ] Symlink/junction dereferencing confirmed before opening file descriptors.
-- [ ] No string-replacement path filters.
-- [ ] Recursive field allowlist active for both root and nested payload structures.
-- [ ] Negative IDOR, cross-tenant, traversal, symlink, and mass-assignment tests passing.
+- [ ] Every SQL mutation includes compound `WHERE tenant_id = ? AND owner_id = ?`.
+- [ ] `cursor.rowcount` verified after every UPDATE; rollback on mismatch.
+- [ ] Identity context bound from verified session, never from client input.
+- [ ] File paths reject `:` before resolution (NTFS ADS block).
+- [ ] Windows reserved device names rejected case-insensitively.
+- [ ] Trailing dots/spaces stripped from path components.
+- [ ] Canonical resolution via `resolve()` + `is_relative_to(base)` enforced.
+- [ ] Schema allowlist active — `tenant_id`, `owner_id`, `id`, `role` unwritable.
+- [ ] All 6 adversarial tests pass against hardened, fail against vulnerable.

@@ -15,7 +15,7 @@ import pathlib
 
 REPO_ROOT = pathlib.Path(__file__).parent.parent
 TEST_FILE = REPO_ROOT / "tests" / "test_auth_adversarial.py"
-MIN_REQUIRED_TESTS = 6
+MIN_REQUIRED_TESTS = 8
 
 
 def run_collection_check() -> int:

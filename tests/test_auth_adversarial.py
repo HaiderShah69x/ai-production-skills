@@ -2,23 +2,26 @@
 tests/test_auth_adversarial.py — Adversarial test suite for Skill 03.
 
 Verifies physical SQLite state and OS-level boundary enforcement via
-dispatch_request wire format. Every negative test asserts both HTTP
-status AND database state integrity. Services are initialized using
-create_isolated_db().
+live loopback TCP sockets and raw HTTP wire bytes using http.client.HTTPConnection.
+Every negative test asserts both HTTP status AND database state integrity.
+Services are initialized using create_isolated_db() and hosted on an ephemeral
+kernel-allocated port per test session.
 
-Tests:
+Tests (8 total):
   1. test_cross_tenant_idor_mutation_blocked
   2. test_sql_mutation_rowcount_integrity
-  3. test_windows_device_names_blocked (parametrized CON, NUL.txt, aux.dat)
+  3. test_windows_device_names_blocked (parametrized: CON, NUL.txt, aux.dat -> 3 tests)
   4. test_ntfs_alternate_data_stream_blocked
   5. test_mass_assignment_type_and_tenant_tampering
   6. test_positive_authorized_update
 """
 
+import http.client
 import json
 import os
-import sys
 import pathlib
+import sys
+import threading
 import pytest
 
 REPO_ROOT = pathlib.Path(__file__).parent.parent
@@ -27,9 +30,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from fixtures.auth_fixtures import (
     create_isolated_db,
+    create_auth_server,
     VulnerableDocumentService,
     HardenedDocumentService,
-    dispatch_request,
 )
 
 
@@ -47,20 +50,71 @@ def get_service(db_uri: str | None = None, conn=None):
 
 
 # ---------------------------------------------------------------------------
-# Test 1: Cross-Tenant IDOR Mutation Blocked
+# Session-Scoped Ephemeral Loopback Server Harness
 # ---------------------------------------------------------------------------
-def test_cross_tenant_idor_mutation_blocked():
+
+@pytest.fixture(scope="session")
+def auth_server():
     """
-    Authenticate as User A (Tenant 1). Issue PUT /documents/doc_2 with
-    {"content": "tampered"}. Assert status 403/404 AND doc_2 in SQLite
-    remains exactly "Tenant 2 Private Data".
+    Spins up a lightweight ThreadingHTTPServer on an ephemeral port (port 0)
+    bound to loopback ('127.0.0.1') for the lifetime of the test session.
     """
     db_uri, conn = create_isolated_db()
-    svc = get_service(db_uri=db_uri, conn=conn)
+    service = get_service(db_uri=db_uri, conn=conn)
+    server = create_auth_server(service, "127.0.0.1", 0)
+    port = server.server_address[1]
 
-    status, body = dispatch_request(
-        svc, "PUT", "/documents/doc_2", {},
-        json.dumps({"content": "tampered"}).encode(),
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    yield ("127.0.0.1", port, service)
+
+    server.shutdown()
+    server.server_close()
+    conn.close()
+
+
+@pytest.fixture(autouse=True)
+def reset_db_state(auth_server):
+    """Resets database contents to known seed state before each test."""
+    _, _, service = auth_server
+    service.reset_db()
+    yield
+
+
+def wire_request(host: str, port: int, method: str, path: str, body: bytes = b"", headers: dict = None) -> tuple[int, dict]:
+    """Transmits raw HTTP bytes over live TCP socket via http.client.HTTPConnection."""
+    conn = http.client.HTTPConnection(host, port, timeout=5)
+    try:
+        req_headers = headers.copy() if headers else {}
+        if body and "Content-Type" not in req_headers:
+            req_headers["Content-Type"] = "application/json"
+        conn.request(method, path, body=body, headers=req_headers)
+        resp = conn.getresponse()
+        raw = resp.read()
+        try:
+            data = json.loads(raw.decode("utf-8")) if raw else {}
+        except Exception:
+            data = {"raw": raw.decode("utf-8", errors="ignore")}
+        return resp.status, data
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 1: Cross-Tenant IDOR Mutation Blocked
+# ---------------------------------------------------------------------------
+def test_cross_tenant_idor_mutation_blocked(auth_server):
+    """
+    Authenticate as User A (Tenant 1). Transmit PUT /documents/doc_2 with
+    {"content": "tampered"} over TCP socket. Assert status 403/404 AND doc_2
+    in SQLite remains exactly "Tenant 2 Private Data".
+    """
+    host, port, svc = auth_server
+
+    status, body = wire_request(
+        host, port, "PUT", "/documents/doc_2",
+        body=json.dumps({"content": "tampered"}).encode(),
     )
     assert status in (403, 404), (
         f"IDOR DEFECT! Cross-tenant mutation returned {status}: {body}"
@@ -74,17 +128,16 @@ def test_cross_tenant_idor_mutation_blocked():
 # ---------------------------------------------------------------------------
 # Test 2: SQL Mutation Rowcount Integrity
 # ---------------------------------------------------------------------------
-def test_sql_mutation_rowcount_integrity():
+def test_sql_mutation_rowcount_integrity(auth_server):
     """
-    Issue an update against an unowned/non-existent document ID. Assert the
-    service detects cursor.rowcount == 0 and denies the mutation with 403/404.
+    Issue an update against an unowned/non-existent document ID over TCP.
+    Assert the service detects cursor.rowcount == 0 and denies the mutation with 403/404.
     """
-    db_uri, conn = create_isolated_db()
-    svc = get_service(db_uri=db_uri, conn=conn)
+    host, port, svc = auth_server
 
-    status, body = dispatch_request(
-        svc, "PUT", "/documents/doc_nonexistent", {},
-        json.dumps({"content": "ghost"}).encode(),
+    status, body = wire_request(
+        host, port, "PUT", "/documents/doc_nonexistent",
+        body=json.dumps({"content": "ghost"}).encode(),
     )
     assert status in (403, 404), (
         f"ROWCOUNT DEFECT! Update to non-existent doc returned {status}: {body}"
@@ -95,16 +148,15 @@ def test_sql_mutation_rowcount_integrity():
 # Test 3: Windows Device Names Blocked
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("device_name", ["CON", "NUL.txt", "aux.dat"])
-def test_windows_device_names_blocked(device_name):
+def test_windows_device_names_blocked(auth_server, device_name):
     """
-    Request files named CON, NUL.txt, or aux.dat. Assert rejection without
-    hanging or blocking the process.
+    Request files named CON, NUL.txt, or aux.dat over TCP socket.
+    Assert rejection (400 or 403) without hanging or blocking the process.
     """
-    db_uri, conn = create_isolated_db()
-    svc = get_service(db_uri=db_uri, conn=conn)
+    host, port, svc = auth_server
 
-    status, body = dispatch_request(
-        svc, "GET", f"/files/{device_name}", {}, b"",
+    status, body = wire_request(
+        host, port, "GET", f"/files/{device_name}",
     )
     assert status in (400, 403), (
         f"DEVICE NAME DEFECT! Request for {device_name!r} returned {status}: {body}"
@@ -114,15 +166,14 @@ def test_windows_device_names_blocked(device_name):
 # ---------------------------------------------------------------------------
 # Test 4: NTFS Alternate Data Stream Blocked
 # ---------------------------------------------------------------------------
-def test_ntfs_alternate_data_stream_blocked():
+def test_ntfs_alternate_data_stream_blocked(auth_server):
     """
-    Request file.txt:stream. Assert immediate rejection (HTTP 400 or 403).
+    Request file.txt:stream over TCP socket. Assert immediate rejection (HTTP 400 or 403).
     """
-    db_uri, conn = create_isolated_db()
-    svc = get_service(db_uri=db_uri, conn=conn)
+    host, port, svc = auth_server
 
-    status, body = dispatch_request(
-        svc, "GET", "/files/file.txt:stream", {}, b"",
+    status, body = wire_request(
+        host, port, "GET", "/files/file.txt:stream",
     )
     assert status in (400, 403), (
         f"ADS DEFECT! NTFS alternate stream request returned {status}: {body}"
@@ -132,23 +183,22 @@ def test_ntfs_alternate_data_stream_blocked():
 # ---------------------------------------------------------------------------
 # Test 5: Mass-Assignment of Protected Fields Rejected
 # ---------------------------------------------------------------------------
-def test_mass_assignment_type_and_tenant_tampering():
+def test_mass_assignment_type_and_tenant_tampering(auth_server):
     """
     Issue PUT /documents/doc_1 with payload containing content (valid),
-    tenant_id (protected), and role (non-schema list type). Assert content
-    updates while tenant_id remains "tenant_1" in SQLite.
+    tenant_id (protected), and role (non-schema list type) over TCP socket.
+    Assert content updates while tenant_id remains "tenant_1" in SQLite.
     """
-    db_uri, conn = create_isolated_db()
-    svc = get_service(db_uri=db_uri, conn=conn)
+    host, port, svc = auth_server
 
     payload = {
         "content": "updated",
         "tenant_id": "tenant_2",
         "role": ["admin"],
     }
-    status, body = dispatch_request(
-        svc, "PUT", "/documents/doc_1", {},
-        json.dumps(payload).encode(),
+    status, body = wire_request(
+        host, port, "PUT", "/documents/doc_1",
+        body=json.dumps(payload).encode(),
     )
     actual_content = svc.get_document_content("doc_1")
     actual_tenant = svc.get_document_field("doc_1", "tenant_id")
@@ -164,18 +214,17 @@ def test_mass_assignment_type_and_tenant_tampering():
 # ---------------------------------------------------------------------------
 # Test 6: Positive Authorized Update
 # ---------------------------------------------------------------------------
-def test_positive_authorized_update():
+def test_positive_authorized_update(auth_server):
     """
-    User A (Tenant 1) updates doc_1 with valid content payload. Assert
-    HTTP 200 and database reflects the new content.
+    User A (Tenant 1) updates doc_1 with valid content payload over TCP socket.
+    Assert HTTP 200 and database reflects the new content.
     """
-    db_uri, conn = create_isolated_db()
-    svc = get_service(db_uri=db_uri, conn=conn)
+    host, port, svc = auth_server
 
     new_content = "Authorized content update by usr_a"
-    status, body = dispatch_request(
-        svc, "PUT", "/documents/doc_1", {},
-        json.dumps({"content": new_content}).encode(),
+    status, body = wire_request(
+        host, port, "PUT", "/documents/doc_1",
+        body=json.dumps({"content": new_content}).encode(),
     )
     assert status == 200, (
         f"POSITIVE PARITY DEFECT! Authorized update returned {status}: {body}"

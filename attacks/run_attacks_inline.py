@@ -26,6 +26,8 @@ Pass/fail semantics differ by target so the same harness grades both apps.
 import argparse
 import importlib.util
 import json
+import multiprocessing as mp
+import os
 import pathlib
 import re
 import select
@@ -35,7 +37,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from http.server import ThreadingHTTPServer
 
 # ---------------------------------------------------------------------------
@@ -97,42 +99,62 @@ def load_handler(path: pathlib.Path):
 
 
 # ---------------------------------------------------------------------------
-# Attack A — concurrent quota contention
+# Attack A — concurrent quota contention (multi-process OS concurrency)
 # ---------------------------------------------------------------------------
+def _worker_buy_process(barrier, url: str) -> tuple[int, bool, int]:
+    """
+    Worker task executing in a distinct operating system process.
+    Synchronizes on barrier to ensure true simultaneous concurrency across
+    distinct PIDs, independently opening a new HTTP connection over loopback sockets
+    to test true OS-level TCP backlog and SQLite database lock contention.
+    Returns (status_code, is_crash, pid).
+    """
+    pid = os.getpid()
+    if barrier is not None:
+        try:
+            barrier.wait(timeout=15)
+        except Exception:
+            pass
+
+    try:
+        req = urllib.request.Request(f"{url}/buy", method="POST", data=b"")
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return (r.status, False, pid)
+    except urllib.error.HTTPError as e:
+        is_crash = e.code >= 500
+        return (e.code, is_crash, pid)
+    except Exception:
+        return (0, True, pid)
+
+
 def attack_a(mode: str) -> None:
     header("Attack A: Atomic Check-and-Act — Concurrent POST /buy")
 
     CONCURRENCY = 50
     QUOTA       = 5
     print(
-        f"  Target : {mode}  |  Concurrency={CONCURRENCY}  Quota={QUOTA}",
+        f"  Target : {mode}  |  Concurrency={CONCURRENCY} (Multi-Process)  Quota={QUOTA}",
         flush=True,
     )
 
-    def buy() -> tuple[int, bool]:
-        """Returns (status_code, crashed: bool)."""
-        try:
-            req = urllib.request.Request(f"{BASE}/buy", method="POST", data=b"")
-            with urllib.request.urlopen(req, timeout=10) as r:
-                return (r.status, False)
-        except urllib.error.HTTPError as e:
-            is_crash = e.code >= 500
-            return (e.code, is_crash)
-        except Exception:
-            return (0, True)
+    manager = mp.Manager()
+    barrier = manager.Barrier(CONCURRENCY)
 
-    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        results = [
-            f.result()
-            for f in as_completed([pool.submit(buy) for _ in range(CONCURRENCY)])
+    with ProcessPoolExecutor(max_workers=CONCURRENCY) as pool:
+        futures = [
+            pool.submit(_worker_buy_process, barrier, BASE)
+            for _ in range(CONCURRENCY)
         ]
+        results = [f.result() for f in as_completed(futures)]
 
-    statuses = [s for s, _ in results]
-    crashes = sum(1 for _, c in results if c)
+    statuses = [s for s, _, _ in results]
+    crashes = sum(1 for _, c, _ in results if c)
+    pids = set(pid for _, _, pid in results)
     successes = statuses.count(200)
     out_of_stock = statuses.count(409)
 
     print("\n  Worker Outcome Distribution:", flush=True)
+    print(f"    - Unique Worker PIDs        : {len(pids)} (expected {CONCURRENCY})", flush=True)
     print(f"    - Success (200)             : {successes}", flush=True)
     print(f"    - Out of Stock (409)        : {out_of_stock}", flush=True)
     print(f"    - Unhandled Crashes (500/Ex): {crashes}", flush=True)
@@ -221,12 +243,22 @@ def send_raw_http(raw_header: bytes, body_chunks: list[bytes] = None) -> tuple[i
             else:
                 sock.settimeout(2.0)
                 for chunk in body_chunks:
+                    # Check if server sent an early response (e.g. streaming cap reached)
+                    r, _, _ = select.select([sock], [], [], 0.02)
+                    if r:
+                        while True:
+                            try:
+                                sock.settimeout(0.5)
+                                data = sock.recv(4096)
+                                if not data:
+                                    break
+                                resp += data
+                            except Exception:
+                                break
+                        break
                     try:
                         sock.sendall(chunk)
                     except (BrokenPipeError, ConnectionResetError, OSError):
-                        break
-                    r, _, _ = select.select([sock], [], [], 0)
-                    if r:
                         break
 
         # Read any remaining response bytes

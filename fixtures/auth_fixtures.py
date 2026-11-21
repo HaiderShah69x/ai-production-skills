@@ -1,21 +1,25 @@
 """
 fixtures/auth_fixtures.py — SQLite-backed vulnerable and hardened document services.
 
-Replaces in-memory mock abstractions with real database state, wire-format
-dispatch, and OS-level path enforcement using isolated in-memory SQLite URIs.
+Replaces in-memory mock abstractions with real database state, live TCP loopback
+server harness, and OS-level handle containment using isolated in-memory SQLite URIs.
 
 Production blind spots covered:
   1. Cross-tenant IDOR via un-scoped SQL mutations.
   2. Path traversal, symlink/junction escapes, NTFS ADS, Windows device names.
   3. Mass-assignment of tenant_id, owner_id, role, or arbitrary keys.
+  4. TOCTOU filesystem races defeated via handle-based path confinement.
 """
 
+import ctypes
 import json
 import os
 import pathlib
 import re
 import sqlite3
+import threading
 import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Tuple
 
 FIXTURES_DIR = pathlib.Path(__file__).parent.resolve()
@@ -98,7 +102,8 @@ class VulnerableDocumentService:
     Intentionally insecure service:
       - Updates via insecure query: UPDATE documents SET content = ? WHERE id = ?;
         (completely ignoring tenant and owner boundaries, and ignoring rowcount).
-      - Direct file read using base_dir / filename without canonicalization or device name filtering.
+      - Direct file read using base_dir / filename without canonicalization, device name filtering,
+        or handle containment.
       - Direct dictionary assignment accepting any key (allowing mass assignment of tenant_id, owner_id, or arbitrary roles).
     """
 
@@ -116,6 +121,16 @@ class VulnerableDocumentService:
         self.session_tenant_id = tenant_id
         self.session_user_id = user_id
 
+    def reset_db(self) -> None:
+        conn = sqlite3.connect(self.db_uri, uri=True)
+        try:
+            with conn:
+                conn.execute("UPDATE documents SET content = 'Tenant 1 Private Data', tenant_id = 'tenant_1', owner_id = 'usr_a', title = 'Doc 1' WHERE id = 'doc_1';")
+                conn.execute("UPDATE documents SET content = 'Tenant 2 Private Data', tenant_id = 'tenant_2', owner_id = 'usr_b', title = 'Doc 2' WHERE id = 'doc_2';")
+                conn.execute("DELETE FROM documents WHERE id NOT IN ('doc_1', 'doc_2');")
+        finally:
+            conn.close()
+
     def update_document(self, doc_id: str, new_content: str) -> Tuple[int, dict]:
         """FLAW: Insecure query ignoring tenant and owner boundaries, and ignoring rowcount."""
         conn = sqlite3.connect(self.db_uri, uri=True)
@@ -130,7 +145,7 @@ class VulnerableDocumentService:
             conn.close()
 
     def read_file(self, filename: str) -> str:
-        """FLAW: Direct file read using base_dir / filename without canonicalization or device name filtering."""
+        """FLAW: Direct file read using base_dir / filename without canonicalization, device filtering, or handle bounds."""
         target = self.base_dir / filename
         with open(target, "r", encoding="utf-8") as f:
             return f.read()
@@ -196,11 +211,13 @@ class HardenedDocumentService:
     Production-grade service enforcing:
       - Compound SQL mutation: UPDATE documents SET content = ? WHERE id = ? AND tenant_id = ? AND owner_id = ?;
       - Verifies cursor.rowcount == 1. If rowcount == 0, rolls back and returns HTTP 404/403.
-      - Filesystem canonical bounds:
+      - Handle-Based Path Confinement (TOCTOU Defense):
         * Reject any filename containing ':' immediately (blocks NTFS Alternate Data Streams).
-        * Reject Windows reserved device names: CON, PRN, AUX, NUL, COM1-COM9, LPT1-LPT9 (case-insensitive check against filename stem).
         * Strip trailing dots ('.') and whitespace before path evaluation.
+        * Reject Windows reserved device names: CON, PRN, AUX, NUL, COM1-COM9, LPT1-LPT9 (case-insensitive check against filename stem).
         * Resolve target canonically and strictly enforce target.resolve().is_relative_to(base_dir.resolve()) and target != base_dir.
+        * Open file descriptor via os.open(), query canonical device volume path from handle (GetFinalPathNameByHandleW on Windows),
+          strip '\\?\\' prefixes, and verify handle containment before reading.
       - Strict schema allowlist: only permits updating 'title' and 'content' as strings; drops or rejects modifications to tenant_id, owner_id, or id.
     """
 
@@ -222,6 +239,16 @@ class HardenedDocumentService:
     def set_session(self, tenant_id: str, user_id: str) -> None:
         self.session_tenant_id = tenant_id
         self.session_user_id = user_id
+
+    def reset_db(self) -> None:
+        conn = sqlite3.connect(self.db_uri, uri=True)
+        try:
+            with conn:
+                conn.execute("UPDATE documents SET content = 'Tenant 1 Private Data', tenant_id = 'tenant_1', owner_id = 'usr_a', title = 'Doc 1' WHERE id = 'doc_1';")
+                conn.execute("UPDATE documents SET content = 'Tenant 2 Private Data', tenant_id = 'tenant_2', owner_id = 'usr_b', title = 'Doc 2' WHERE id = 'doc_2';")
+                conn.execute("DELETE FROM documents WHERE id NOT IN ('doc_1', 'doc_2');")
+        finally:
+            conn.close()
 
     def update_document(self, doc_id: str, new_content: str) -> Tuple[int, dict]:
         """Compound SQL mutation with rowcount verification."""
@@ -270,9 +297,36 @@ class HardenedDocumentService:
             raise PermissionError(f"Access denied: path escapes base directory {base}")
 
         if not canonical_target.is_file():
-            raise FileNotFoundError("File not found")
+            raise FileNotFoundError(f"File not found: {filename}")
 
-        return canonical_target.read_text(encoding="utf-8")
+        # 5. Enforce Handle-Based Path Confinement (TOCTOU Defense)
+        fd = os.open(str(canonical_target), os.O_RDONLY)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                handle = msvcrt.get_osfhandle(fd)
+                buf = ctypes.create_unicode_buffer(1024)
+                res = ctypes.windll.kernel32.GetFinalPathNameByHandleW(handle, buf, 1024, 0)
+                if res == 0:
+                    raise PermissionError("Failed to resolve final path from file handle")
+                canonical_str = buf.value.removeprefix("\\\\?\\")
+                canonical_path = pathlib.Path(canonical_str).resolve()
+            else:
+                canonical_path = pathlib.Path(os.path.realpath(f"/proc/self/fd/{fd}")).resolve()
+
+            if not canonical_path.is_relative_to(base) or canonical_path == base:
+                raise PermissionError(f"Handle boundary escape: {canonical_path} not within {base}")
+
+            with os.fdopen(fd, "r", encoding="utf-8") as f:
+                content = f.read()
+                fd = None  # fdopen transfers ownership
+                return content
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
     def update_document_fields(self, doc_id: str, data: Dict[str, Any]) -> Tuple[int, dict]:
         """Strict schema allowlist: only permits updating title and content as strings."""
@@ -329,54 +383,91 @@ class HardenedDocumentService:
 
 
 # ---------------------------------------------------------------------------
-# Wire Dispatcher
+# Loopback Server & Request Handler
 # ---------------------------------------------------------------------------
 
-def dispatch_request(
-    service: VulnerableDocumentService | HardenedDocumentService,
-    method: str,
-    path: str,
-    headers: dict,
-    raw_body: bytes,
-) -> Tuple[int, dict]:
+class AuthRequestHandler(BaseHTTPRequestHandler):
     """
-    Minimal wire-format dispatcher.
-
-    Identity context (tenant_id, user_id) MUST be bound strictly from
-    verified session context in the service, never read from client query params,
-    unverified headers, or JSON body.
+    Lightweight HTTP request handler exposing document and file endpoints
+    over live TCP sockets. Identity context is strictly bound from service session.
     """
-    parts = [p for p in path.strip("/").split("/") if p]
 
-    # PUT /documents/<doc_id>
-    if method == "PUT" and len(parts) == 2 and parts[0] == "documents":
-        doc_id = parts[1]
-        try:
-            body = json.loads(raw_body) if raw_body else {}
-        except (json.JSONDecodeError, ValueError):
-            return (400, {"error": "invalid JSON"})
+    def log_message(self, format, *args):  # noqa: A002
+        pass
 
-        if not isinstance(body, dict):
-            return (400, {"error": "body must be a JSON object"})
+    @property
+    def service(self):
+        return self.server.service
 
-        # If body has only "content", use the simpler update_document path
-        if set(body.keys()) == {"content"} and isinstance(body["content"], str):
-            return service.update_document(doc_id, body["content"])
+    def _send_json(self, status: int, data: dict) -> None:
+        body = json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-        # Otherwise use the multi-field update path
-        return service.update_document_fields(doc_id, body)
+    def do_PUT(self) -> None:
+        parts = [p for p in self.path.strip("/").split("/") if p]
+        if len(parts) == 2 and parts[0] == "documents":
+            doc_id = parts[1]
+            try:
+                cl = int(self.headers.get("Content-Length", 0))
+                raw_body = self.rfile.read(cl) if cl > 0 else b""
+                body = json.loads(raw_body) if raw_body else {}
+            except (json.JSONDecodeError, ValueError):
+                self._send_json(400, {"error": "invalid JSON"})
+                return
 
-    # GET /files/<filename>
-    if method == "GET" and len(parts) >= 2 and parts[0] == "files":
-        filename = "/".join(parts[1:])
-        try:
-            content = service.read_file(filename)
-            return (200, {"content": content})
-        except ValueError as e:
-            return (400, {"error": str(e)})
-        except PermissionError as e:
-            return (403, {"error": str(e)})
-        except FileNotFoundError as e:
-            return (404, {"error": str(e)})
+            if not isinstance(body, dict):
+                self._send_json(400, {"error": "body must be a JSON object"})
+                return
 
-    return (404, {"error": "not found"})
+            if set(body.keys()) == {"content"} and isinstance(body["content"], str):
+                status, res = self.service.update_document(doc_id, body["content"])
+            else:
+                status, res = self.service.update_document_fields(doc_id, body)
+            self._send_json(status, res)
+            return
+
+        self._send_json(404, {"error": "not found"})
+
+    def do_GET(self) -> None:
+        path_only = self.path.split("?", 1)[0]
+        parts = [p for p in path_only.strip("/").split("/") if p]
+
+        if len(parts) == 2 and parts[0] == "documents":
+            doc_id = parts[1]
+            content = self.service.get_document_content(doc_id)
+            if content is not None:
+                self._send_json(200, {"id": doc_id, "content": content})
+            else:
+                self._send_json(404, {"error": "document not found"})
+            return
+
+        if len(parts) >= 2 and parts[0] == "files":
+            filename = "/".join(parts[1:])
+            try:
+                content = self.service.read_file(filename)
+                self._send_json(200, {"content": content})
+            except ValueError as e:
+                self._send_json(400, {"error": str(e)})
+            except PermissionError as e:
+                self._send_json(403, {"error": str(e)})
+            except FileNotFoundError as e:
+                self._send_json(404, {"error": str(e)})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+            return
+
+        self._send_json(404, {"error": "not found"})
+
+
+def create_auth_server(service, host: str = "127.0.0.1", port: int = 0) -> ThreadingHTTPServer:
+    """
+    Instantiate a ThreadingHTTPServer bound to an ephemeral kernel-allocated port (port=0).
+    Attaches the provided document service to the server instance.
+    """
+    server = ThreadingHTTPServer((host, port), AuthRequestHandler)
+    server.service = service
+    return server

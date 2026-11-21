@@ -32,6 +32,12 @@ of concurrent callers.
 
 ### Deployment Scope: Single-Process vs Multi-Process / Distributed
 
+- **Multi-Process OS Concurrency Verification:** In multi-process and multi-worker
+  architectures, concurrency benchmarks **must not** rely on thread-pool illusions (`ThreadPoolExecutor`).
+  Adversarial harnesses **MUST** spawn distinct operating system processes (`ProcessPoolExecutor` or `multiprocessing.Process`)
+  with separate PIDs that each independently establish raw TCP loopback socket connections.
+  This ensures real kernel-level TCP backlog contention, socket buffer pressure, and true
+  multi-process SQLite database lock contention.
 - **Process-local mutexes explicitly rejected for multi-process topologies:** In-memory
   synchronization primitives (e.g., `threading.Lock()`, `sync.Mutex`, Java `synchronized`)
   are **strictly forbidden** as synchronization controls in multi-process architectures
@@ -227,12 +233,14 @@ Test suites that do not exercise failure paths are considered incomplete.
 
 ### 1. Concurrent Quota / Shared-State Test
 
-Send **N concurrent requests** that each attempt to consume from a quota of
-**Q** (where N > Q). Assert:
+Execute **N concurrent worker requests** via distinct operating system processes
+(`ProcessPoolExecutor` with unique PIDs) that each independently connect over live TCP loopback
+sockets to attempt to consume from a quota of **Q** (where N > Q). Assert:
 
-- Exactly Q requests succeed.
-- Exactly N − Q requests are rejected (e.g., HTTP 409 / 429 / 402).
-- Final stored value equals 0 (fully consumed but never negative).
+- Exactly Q requests succeed (HTTP 200).
+- Exactly N − Q requests receive bounded rejection signals (HTTP 409 Conflict).
+- Zero unhandled worker crashes (`crash_count == 0`).
+- Final stored value equals 0 (fully consumed but never negative, sold equals Q).
 
 ### 2. Oversized Payload & Chunked Stream Test
 

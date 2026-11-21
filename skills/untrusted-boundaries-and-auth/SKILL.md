@@ -54,7 +54,13 @@ Every filesystem path resolved from client input **must** be canonically resolve
   canonical_target = (base / clean_name).resolve()
   assert canonical_target.is_relative_to(base) and canonical_target != base
   ```
-- **Symlink/Junction Dereferencing:** `resolve()` follows symlinks and junctions — the real target must reside inside `base`.
+- **Handle-Based Path Confinement (TOCTOU Defense):** To prevent time-of-check to time-of-use
+  (TOCTOU) symlink races, open the file descriptor first using `os.open(str(target), os.O_RDONLY)`
+  and query the final canonical device volume path directly from the opened handle before reading.
+  On Windows, resolve using `ctypes.windll.kernel32.GetFinalPathNameByHandleW` via `msvcrt.get_osfhandle(fd)`,
+  strip device prefix namespaces (`\\?\`), and verify `canonical_path.is_relative_to(base_dir.resolve())`.
+  On POSIX, resolve via `/proc/self/fd/{fd}` or `realpath`. Close the descriptor cleanly if containment fails.
+- **Symlink/Junction Dereferencing:** Both path resolution and handle inspection follow symlinks and junctions — the real underlying target must reside strictly inside `base`.
 - **Forbid String Replacement Sanitizers:** Never rely on stripping `../`, regex blacklists, or substring filters.
 
 ---
@@ -80,14 +86,16 @@ All client payloads **must** be filtered against an explicit schema allowlist be
 
 ## Verification Requirements
 
-The test suite must verify physical database state through `dispatch_request` wire format:
+The adversarial test suite runs against a live loopback server (`http.server.ThreadingHTTPServer(('127.0.0.1', 0), ...)`)
+on an ephemeral kernel-allocated port, transmitting raw HTTP wire bytes using `http.client.HTTPConnection`.
+Synthetic dispatch mocks are eliminated. Every negative test asserts both HTTP status and physical database state:
 
-1. **Cross-Tenant IDOR Mutation:** User A (Tenant 1) issues `PUT /documents/doc_2`. Assert HTTP 403/404 AND doc_2 content in SQLite remains unchanged.
-2. **Rowcount Integrity:** Update a non-existent document ID. Assert HTTP 403/404 and zero state mutation.
-3. **Windows Device Names:** Request `CON`, `NUL.txt`, `aux.dat`. Assert rejection without process hang.
-4. **NTFS Alternate Data Stream:** Request `file.txt:stream`. Assert immediate rejection (HTTP 400/403).
-5. **Mass-Assignment Tampering:** PUT with `{"content": "valid", "tenant_id": "tenant_2", "role": ["admin"]}`. Assert content updates while tenant_id remains `"tenant_1"` in SQLite.
-6. **Positive Parity:** User A updates own doc_1 with valid payload. Assert HTTP 200 and database reflects new content.
+1. **Cross-Tenant IDOR Mutation:** User A (Tenant 1) issues `PUT /documents/doc_2` over live TCP socket. Assert HTTP 403/404 AND doc_2 content in SQLite remains unchanged ("Tenant 2 Private Data").
+2. **Rowcount Integrity:** Update a non-existent document ID over TCP. Assert HTTP 403/404 and zero state mutation.
+3. **Windows Device Names:** Request `CON`, `NUL.txt`, `aux.dat` over TCP. Assert rejection (HTTP 400/403) without process hang.
+4. **NTFS Alternate Data Stream:** Request `file.txt:stream` over TCP. Assert immediate rejection (HTTP 400/403).
+5. **Mass-Assignment Tampering:** PUT `/documents/doc_1` with `{"content": "valid", "tenant_id": "tenant_2", "role": ["admin"]}`. Assert content updates while `tenant_id` remains `"tenant_1"` in SQLite.
+6. **Positive Parity:** User A updates own `doc_1` with valid payload over TCP. Assert HTTP 200 and database reflects new content.
 
 ---
 
@@ -100,5 +108,7 @@ The test suite must verify physical database state through `dispatch_request` wi
 - [ ] Windows reserved device names rejected case-insensitively.
 - [ ] Trailing dots/spaces stripped from path components.
 - [ ] Canonical resolution via `resolve()` + `is_relative_to(base)` enforced.
+- [ ] Handle-based path confinement verifies opened file descriptor via device handle before reading.
 - [ ] Schema allowlist active — `tenant_id`, `owner_id`, `id`, `role` unwritable.
-- [ ] All 6 adversarial tests pass against hardened, fail against vulnerable.
+- [ ] Live ephemeral loopback TCP sockets tested with `http.client.HTTPConnection`.
+- [ ] All 8 adversarial tests pass against hardened, fail against vulnerable.

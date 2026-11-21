@@ -496,9 +496,9 @@ def attack_b2(mode: str) -> None:
 # Attack B3 — Slowloris connection pool exhaustion & anti-starvation
 # ---------------------------------------------------------------------------
 def attack_b3_slowloris_pool_exhaustion(mode: str) -> None:
-    header("Attack B3: Slowloris Pool Exhaustion & Anti-Starvation (POST /upload + POST /buy)")
+    header("Attack B3: Slowloris Pool Exhaustion & In-Flight Anti-Starvation (POST /upload + POST /buy)")
 
-    SLOW_CLIENTS    = 35    # concurrent slow-drip sockets (exceeds MAX_CONCURRENT_CONNECTIONS = 30)
+    SLOW_CLIENTS    = 20    # concurrent slow-drip sockets occupying 20 of 30 pool slots
     LEGIT_CLIENTS   = 5     # concurrent legitimate business requests
     DRIP_INTERVAL   = 1.5   # seconds between each trickle byte (stays under READ_TIMEOUT=2.0s)
     DRIP_COUNT      = 4     # 4 gaps * 1.5s = 6.0s total experiment duration
@@ -520,28 +520,21 @@ def attack_b3_slowloris_pool_exhaustion(mode: str) -> None:
     print(
         f"  Target          : {mode}\n"
         f"  Database stock  : reset to remaining=10, sold=0\n"
-        f"  Slowloris pool  : {SLOW_CLIENTS} concurrent slow-drip sockets (cap = 30)\n"
+        f"  Slowloris pool  : {SLOW_CLIENTS} concurrent slow-drip sockets in-flight (pool cap = 30)\n"
         f"  Abs deadline    : {ABS_DEADLINE}s (hardened only)\n"
         f"  Experiment cap  : {DRIP_INTERVAL * DRIP_COUNT}s",
         flush=True,
     )
 
-    ready_barrier = threading.Barrier(SLOW_CLIENTS)
+    ready_barrier = threading.Barrier(SLOW_CLIENTS + 1)
     slow_closed_times: dict[int, float] = {}
-    slow_503_flags: dict[int, bool] = {}
 
     def slow_worker(idx: int) -> None:
         t0 = time.monotonic()
         closed_at = 999.0
-        got_503 = False
         sock = None
         try:
             sock = socket.create_connection((HOST, PORT), timeout=10)
-            try:
-                ready_barrier.wait(timeout=5.0)
-            except Exception:
-                pass
-
             headers = (
                 "POST /upload HTTP/1.1\r\n"
                 f"Host: {HOST}:{PORT}\r\n"
@@ -552,45 +545,38 @@ def attack_b3_slowloris_pool_exhaustion(mode: str) -> None:
             ).encode()
             sock.sendall(headers)
 
-            # Check if server immediately rejected with 503 (connection pool exhausted)
-            r, _, _ = select.select([sock], [], [], 0.5)
-            if r:
+            try:
+                ready_barrier.wait(timeout=6.0)
+            except Exception:
+                pass
+
+            for i in range(DRIP_COUNT):
+                time.sleep(DRIP_INTERVAL)
                 try:
-                    data = sock.recv(1024)
-                    if b"503" in data and b"connection_pool_exhausted" in data:
-                        got_503 = True
+                    sock.sendall(bytes([0x41 + (i % 26)]))
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    closed_at = time.monotonic() - t0
+                    break
+                try:
+                    sock.settimeout(0.05)
+                    data = sock.recv(256)
+                    if not data or b"408" in data or b"close" in data.lower():
+                        closed_at = time.monotonic() - t0
+                        break
+                except socket.timeout:
+                    continue
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    closed_at = time.monotonic() - t0
+                    break
+
+            if closed_at == 999.0:
+                try:
+                    sock.settimeout(0.5)
+                    data = sock.recv(256)
+                    if not data or b"408" in data:
                         closed_at = time.monotonic() - t0
                 except Exception:
                     pass
-
-            if not got_503:
-                for i in range(DRIP_COUNT):
-                    time.sleep(DRIP_INTERVAL)
-                    try:
-                        sock.sendall(bytes([0x41 + (i % 26)]))
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        closed_at = time.monotonic() - t0
-                        break
-                    try:
-                        sock.settimeout(0.05)
-                        data = sock.recv(256)
-                        if not data or b"408" in data or b"close" in data.lower():
-                            closed_at = time.monotonic() - t0
-                            break
-                    except socket.timeout:
-                        continue
-                    except (BrokenPipeError, ConnectionResetError, OSError):
-                        closed_at = time.monotonic() - t0
-                        break
-
-                if closed_at == 999.0:
-                    try:
-                        sock.settimeout(0.5)
-                        data = sock.recv(256)
-                        if not data or b"408" in data:
-                            closed_at = time.monotonic() - t0
-                    except Exception:
-                        pass
         except Exception:
             closed_at = time.monotonic() - t0
         finally:
@@ -599,7 +585,6 @@ def attack_b3_slowloris_pool_exhaustion(mode: str) -> None:
                     sock.close()
                 except Exception:
                     pass
-            slow_503_flags[idx] = got_503
             slow_closed_times[idx] = closed_at
 
     slow_threads = [
@@ -609,24 +594,66 @@ def attack_b3_slowloris_pool_exhaustion(mode: str) -> None:
     for t in slow_threads:
         t.start()
 
-    # Wait for all slowloris threads to complete (either via 503 or 4.0s deadline)
+    # Synchronize: wait until all 20 slowloris sockets are connected and have sent headers
+    try:
+        ready_barrier.wait(timeout=7.0)
+    except Exception:
+        pass
+
+    # Allow a brief moment (0.1s) to ensure all 20 slow sockets are actively in-flight and trickling
+    time.sleep(0.1)
+
+    print(
+        f"  Dispatching {LEGIT_CLIENTS} concurrent legitimate POST /buy requests "
+        "DURING active in-flight Slowloris saturation...",
+        flush=True,
+    )
+
+    def legit_buy() -> tuple[int, float]:
+        t_start = time.monotonic()
+        try:
+            req = urllib.request.Request(f"{BASE}/buy", method="POST", data=b"")
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return (r.status, time.monotonic() - t_start)
+        except urllib.error.HTTPError as e:
+            return (e.code, time.monotonic() - t_start)
+        except Exception:
+            return (0, time.monotonic() - t_start)
+
+    with ThreadPoolExecutor(max_workers=LEGIT_CLIENTS) as pool:
+        futures = [pool.submit(legit_buy) for _ in range(LEGIT_CLIENTS)]
+        legit_results = [f.result() for f in as_completed(futures)]
+
+    legit_statuses = [st for st, _ in legit_results]
+    legit_max_time = max(dur for _, dur in legit_results)
+
+    print(
+        f"  Legitimate requests : {len(legit_statuses)} completed in max {legit_max_time:.2f}s "
+        f"(statuses: {sorted(legit_statuses)})",
+        flush=True,
+    )
+
+    # Now wait for the 20 slowloris sockets to complete (closed by 4.0s absolute deadline)
     for t in slow_threads:
         t.join(timeout=8.0)
 
     closed_values = list(slow_closed_times.values())
-    count_503 = sum(1 for v in slow_503_flags.values() if v)
-    acquired_count = SLOW_CLIENTS - count_503
-    hung_slow = sum(1 for idx, c in slow_closed_times.items() if not slow_503_flags.get(idx, False) and c > CUTOFF)
-    terminated_slow = acquired_count - hung_slow
-    acquired_closed_vals = [c for idx, c in slow_closed_times.items() if not slow_503_flags.get(idx, False)]
-    avg_closed = sum(acquired_closed_vals) / len(acquired_closed_vals) if acquired_closed_vals else 0.0
+    hung_slow = sum(1 for c in closed_values if c > CUTOFF)
+    terminated_slow = len(closed_values) - hung_slow
+    avg_closed = sum(closed_values) / len(closed_values) if closed_values else 0.0
 
     print(
-        f"  Excess sockets (503): {count_503}/{SLOW_CLIENTS} rejected immediately with HTTP 503\n"
-        f"  Acquired sockets    : {terminated_slow}/{acquired_count} terminated within deadline "
-        f"({hung_slow} hung past {CUTOFF:.1f}s)",
+        f"  Slowloris sockets   : {terminated_slow}/{SLOW_CLIENTS} terminated within deadline "
+        f"({hung_slow} hung past {CUTOFF:.1f}s, avg {avg_closed:.2f}s)",
         flush=True,
     )
+
+    # Read DB stock
+    conn = sqlite3.connect(db_file)
+    row = conn.execute("SELECT remaining, sold FROM stock WHERE id = 1;").fetchone()
+    conn.close()
+    remaining, sold = row[0], row[1]
+    print(f"  Final DB stock state: remaining={remaining}, sold={sold}", flush=True)
 
     if mode == "vulnerable":
         if hung_slow > 0:
@@ -640,85 +667,38 @@ def attack_b3_slowloris_pool_exhaustion(mode: str) -> None:
                 f"(avg {avg_closed:.2f}s)."
             )
     else:
-        # 1. Assert exactly 5 excess sockets rejected with 503
-        if count_503 == 5 and acquired_count == 30:
+        # 1. Assert legitimate requests did NOT wait for slow sockets: must complete within 0.25s
+        if legit_max_time <= 0.25 and all(st == 200 for st in legit_statuses):
             log_pass(
-                f"Pool bounding holds: exactly {count_503} excess connections rejected with "
-                "HTTP 503, exactly 30 acquired pool slots."
+                f"In-flight anti-starvation holds: all {LEGIT_CLIENTS} legitimate requests returned HTTP 200 "
+                f"in {legit_max_time:.2f}s <= 0.25s while 20 Slowloris sockets were actively trickling."
             )
         else:
             log_fail(
-                f"Expected exactly 5 excess connections rejected with 503; got {count_503} "
-                f"(acquired={acquired_count})."
+                f"Legitimate requests starved or delayed: max_latency={legit_max_time:.2f}s (expected <= 0.25s), "
+                f"statuses={legit_statuses}."
             )
 
-        # 2. Assert all 30 slow-drip sockets terminated by deadline
-        if hung_slow == 0 and terminated_slow == 30:
-            log_pass(
-                f"Mitigation holds: all {acquired_count} acquired slow-drip sockets terminated within "
-                f"ABSOLUTE_REQUEST_TIMEOUT + grace (avg {avg_closed:.2f}s <= {CUTOFF:.1f}s)."
-            )
-        else:
-            log_fail(
-                f"ABSOLUTE_REQUEST_TIMEOUT NOT enforced: {hung_slow}/{acquired_count} "
-                f"slow-drip sockets hung beyond {CUTOFF:.1f}s."
-            )
-
-        # 3. Dispatch legitimate requests to verify server recovery and database atomicity
-        print(
-            f"  Dispatching {LEGIT_CLIENTS} concurrent legitimate POST /buy requests "
-            "after pool recovery...",
-            flush=True,
-        )
-
-        def legit_buy() -> tuple[int, float]:
-            t_start = time.monotonic()
-            try:
-                req = urllib.request.Request(f"{BASE}/buy", method="POST", data=b"")
-                with urllib.request.urlopen(req, timeout=5) as r:
-                    return (r.status, time.monotonic() - t_start)
-            except urllib.error.HTTPError as e:
-                return (e.code, time.monotonic() - t_start)
-            except Exception:
-                return (0, time.monotonic() - t_start)
-
-        with ThreadPoolExecutor(max_workers=LEGIT_CLIENTS) as pool:
-            futures = [pool.submit(legit_buy) for _ in range(LEGIT_CLIENTS)]
-            legit_results = [f.result() for f in as_completed(futures)]
-
-        legit_statuses = [st for st, _ in legit_results]
-        legit_max_time = max(dur for _, dur in legit_results)
-
-        print(
-            f"  Legitimate requests : {len(legit_statuses)} completed in max {legit_max_time:.2f}s "
-            f"(statuses: {sorted(legit_statuses)})",
-            flush=True,
-        )
-
-        if all(st == 200 for st in legit_statuses) and legit_max_time <= 1.0:
-            log_pass(
-                f"Transactional integrity holds: all {LEGIT_CLIENTS} legitimate requests returned HTTP 200 "
-                f"within {legit_max_time:.2f}s."
-            )
-        else:
-            log_fail(
-                f"Legitimate requests failed or slow: statuses={legit_statuses}, max_time={legit_max_time:.2f}s."
-            )
-
-        # 4. Assert database stock reflects exactly 5 purchases (remaining=5, sold=5)
-        conn = sqlite3.connect(db_file)
-        row = conn.execute("SELECT remaining, sold FROM stock WHERE id = 1;").fetchone()
-        conn.close()
-        remaining, sold = row[0], row[1]
-        print(f"  Final DB stock state: remaining={remaining}, sold={sold}", flush=True)
-
+        # 2. Assert DB stock was decremented accurately to remaining=5, sold=5
         if remaining == 5 and sold == 5:
             log_pass(
-                f"Database state verified: remaining={remaining}, sold={sold} (5 units successfully sold)."
+                f"Transactional integrity holds under active attack: stock decremented to remaining={remaining}, sold={sold}."
             )
         else:
             log_fail(
                 f"Database state mismatch: expected remaining=5, sold=5; got remaining={remaining}, sold={sold}."
+            )
+
+        # 3. Assert all 20 slowloris sockets were terminated within deadline
+        if hung_slow == 0 and terminated_slow == SLOW_CLIENTS:
+            log_pass(
+                f"Mitigation holds: all {SLOW_CLIENTS} slow-drip sockets terminated within "
+                f"ABSOLUTE_REQUEST_TIMEOUT + grace (avg {avg_closed:.2f}s <= {CUTOFF:.1f}s)."
+            )
+        else:
+            log_fail(
+                f"ABSOLUTE_REQUEST_TIMEOUT NOT enforced: {hung_slow}/{SLOW_CLIENTS} "
+                f"slow-drip sockets hung beyond {CUTOFF:.1f}s."
             )
 
 

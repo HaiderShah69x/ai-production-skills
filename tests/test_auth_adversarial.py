@@ -31,6 +31,9 @@ import sys
 import threading
 import pytest
 
+# Ensure AUTH_HMAC_SECRET is present in the environment for tests
+os.environ.setdefault("AUTH_HMAC_SECRET", "production-secure-hmac-secret-key-32b!")
+
 REPO_ROOT = pathlib.Path(__file__).parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -438,4 +441,95 @@ def test_wire_missing_or_unsigned_authorization_header_rejected_401(auth_server)
     )
     assert status2 == 401, (
         f"AUTH DEFECT! Request with unsigned Authorization header returned {status2}: {body2}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 12: Wire Alg:None Token Rejected (HTTP 401)
+# ---------------------------------------------------------------------------
+def test_alg_none_token_rejection(auth_server):
+    """
+    Transmit tokens with 'alg': 'none' (both in claims payload and JWT header)
+    with empty/omitted signatures.
+    Assert HTTP 401 Unauthorized and database remains untouched.
+    """
+    host, port, svc = auth_server
+
+    # Variant A: Claims payload with {"alg": "none"} and trailing dot (empty sig)
+    payload_a = base64.urlsafe_b64encode(
+        json.dumps({"alg": "none", "tenant_id": "tenant_1", "user_id": "usr_a"}, sort_keys=True).encode()
+    ).decode().rstrip("=")
+    token_none_a = f"{payload_a}."
+
+    status_a, body_a = wire_request(
+        host, port, "PUT", "/documents/doc_1",
+        body=json.dumps({"content": "alg_none_tamper_attempt_a"}).encode(),
+        headers={"Authorization": f"Bearer {token_none_a}"},
+    )
+    assert status_a == 401, (
+        f"AUTH DEFECT! alg:none payload token accepted with status {status_a}: {body_a}"
+    )
+
+    # Variant B: JWT 3-part token with header {"alg": "none", "typ": "JWT"}
+    header_b = base64.urlsafe_b64encode(
+        json.dumps({"alg": "none", "typ": "JWT"}, sort_keys=True).encode()
+    ).decode().rstrip("=")
+    payload_b = base64.urlsafe_b64encode(
+        json.dumps({"tenant_id": "tenant_1", "user_id": "usr_a"}, sort_keys=True).encode()
+    ).decode().rstrip("=")
+    token_none_b = f"{header_b}.{payload_b}."
+
+    status_b, body_b = wire_request(
+        host, port, "PUT", "/documents/doc_1",
+        body=json.dumps({"content": "alg_none_tamper_attempt_b"}).encode(),
+        headers={"Authorization": f"Bearer {token_none_b}"},
+    )
+    assert status_b == 401, (
+        f"AUTH DEFECT! alg:none header token accepted with status {status_b}: {body_b}"
+    )
+
+    actual_doc1 = svc.get_document_content("doc_1")
+    assert actual_doc1 != "alg_none_tamper_attempt_a" and actual_doc1 != "alg_none_tamper_attempt_b", (
+        "AUTH DEFECT! doc_1 mutated via alg:none token"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 13: Wire Truncated and Malformed Base64 Token Rejected (HTTP 401)
+# ---------------------------------------------------------------------------
+def test_truncated_token_rejection(auth_server):
+    """
+    Transmit truncated tokens (missing signature component entirely) and tokens
+    with corrupted/malformed base64.
+    Assert HTTP 401 Unauthorized and database remains untouched.
+    """
+    host, port, svc = auth_server
+
+    # Variant A: Truncated token without signature part
+    truncated_token = TOKEN_USER_A.split(".")[0]
+
+    status_a, body_a = wire_request(
+        host, port, "PUT", "/documents/doc_1",
+        body=json.dumps({"content": "truncated_tamper_attempt"}).encode(),
+        headers={"Authorization": f"Bearer {truncated_token}"},
+    )
+    assert status_a == 401, (
+        f"AUTH DEFECT! Truncated token accepted with status {status_a}: {body_a}"
+    )
+
+    # Variant B: Malformed base64 string
+    malformed_token = "invalid!@#$%^&*().tampered_signature"
+
+    status_b, body_b = wire_request(
+        host, port, "PUT", "/documents/doc_1",
+        body=json.dumps({"content": "malformed_tamper_attempt"}).encode(),
+        headers={"Authorization": f"Bearer {malformed_token}"},
+    )
+    assert status_b == 401, (
+        f"AUTH DEFECT! Malformed token accepted with status {status_b}: {body_b}"
+    )
+
+    actual_doc1 = svc.get_document_content("doc_1")
+    assert actual_doc1 != "truncated_tamper_attempt" and actual_doc1 != "malformed_tamper_attempt", (
+        "AUTH DEFECT! doc_1 mutated via truncated/malformed token"
     )

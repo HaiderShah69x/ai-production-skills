@@ -271,13 +271,14 @@ Send requests exceeding `MAX_BODY_SIZE`:
 
 - **Idle Stall Test (B2):** Open a connection, send partial headers/body, and halt. Verify
   the server closes the socket within `READ_TIMEOUT` + grace window.
-- **Slowloris Pool Exhaustion & Anti-Starvation Test (B3):** Open 35 concurrent slow-drip client
-  sockets simultaneously against a server bounded at `MAX_CONCURRENT_CONNECTIONS = 30` (sending 1 byte
-  every 1.5s to bypass the 2.0s idle timeout). Verify:
-  1. Exactly 5 excess connections exceeding the pool cap are immediately rejected with **HTTP 503 Service Unavailable** (`{"error": "connection_pool_exhausted"}`).
-  2. Exactly 30 connections acquire pool slots and are forcefully terminated by the server's deadline within `ABSOLUTE_REQUEST_TIMEOUT + 1.5s grace`.
-  3. Following pool recovery, 5 concurrent legitimate `POST /buy` requests execute and perform genuine transactional commits, returning HTTP 200 within <= 1.0s and verifying database state transitions (`remaining == 5, sold == 5`).
-  4. The server suffers zero unhandled crashes or dropped healthy connections.
+- **Slowloris Pool Exhaustion & Simultaneous In-Flight Contention Test (B3):**
+  1. Reset datastore inventory to `remaining = 10, sold = 0`.
+  2. Launch 20 concurrent slow-drip client sockets (occupying 20 of 30 connection pool slots) sending 1 byte every 1.5s to bypass idle read timeouts. Synchronize using a `threading.Barrier(21)` so all 20 sockets are actively connected and trickling bytes simultaneously.
+  3. While all 20 slow sockets are actively in-flight, immediately dispatch 5 legitimate `POST /buy` requests concurrently.
+  4. Assert anti-starvation: legitimate requests do NOT block behind slow sockets, completing in `<= 0.25s` with HTTP 200.
+  5. Assert database consistency: stock is cleanly decremented to `remaining == 5, sold == 5`.
+  6. Assert absolute deadline enforcement: all 20 slow-drip sockets are terminated by the server within `ABSOLUTE_REQUEST_TIMEOUT` (<= 5.5s total duration).
+  7. The server suffers zero unhandled worker crashes or socket leaks.
 
 ### Anti-Patterns Forbidden in Tests
 

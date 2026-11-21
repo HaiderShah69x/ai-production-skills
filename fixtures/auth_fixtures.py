@@ -22,6 +22,7 @@ import os
 import pathlib
 import re
 import sqlite3
+import sys
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -44,11 +45,18 @@ _WINDOWS_RESERVED = re.compile(
 # ---------------------------------------------------------------------------
 # Cryptographic Token Authentication (HMAC-SHA256)
 # ---------------------------------------------------------------------------
-HMAC_SECRET = b"production-secure-hmac-secret-key-32b!"
+def get_hmac_secret() -> bytes:
+    """Retrieve HMAC secret strictly from environment variable AUTH_HMAC_SECRET."""
+    secret = os.environ.get("AUTH_HMAC_SECRET")
+    if not secret:
+        raise ValueError("AUTH_HMAC_SECRET environment variable is missing or empty")
+    return secret.encode("utf-8") if isinstance(secret, str) else secret
 
 
-def create_token(payload: dict, secret: bytes = HMAC_SECRET) -> str:
+def create_token(payload: dict, secret: bytes | None = None) -> str:
     """Create signed HMAC-SHA256 bearer token: base64(payload).base64(hmac)."""
+    if secret is None:
+        secret = get_hmac_secret()
     payload_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     payload_b64 = base64.urlsafe_b64encode(payload_bytes).decode("ascii").rstrip("=")
     sig = hmac.new(secret, payload_b64.encode("ascii"), hashlib.sha256).digest()
@@ -56,27 +64,55 @@ def create_token(payload: dict, secret: bytes = HMAC_SECRET) -> str:
     return f"{payload_b64}.{sig_b64}"
 
 
-def verify_token(token: str, secret: bytes = HMAC_SECRET) -> dict | None:
-    """Verify signed HMAC-SHA256 bearer token. Returns payload dict or None on tampered/invalid signature."""
+def verify_token(token: str, secret: bytes | None = None) -> dict | None:
+    """
+    Verify signed HMAC-SHA256 bearer token.
+    Supports 2-part (payload.sig) and 3-part (header.payload.sig) tokens.
+    Strictly rejects alg: 'none', empty/missing signatures, or invalid signatures.
+    Returns payload dict or None on tampered/invalid signature.
+    """
     try:
-        if not token or "." not in token:
+        if secret is None:
+            secret = get_hmac_secret()
+        if not isinstance(token, str) or not token or "." not in token:
             return None
         parts = token.split(".")
-        if len(parts) != 2:
+        if len(parts) == 2:
+            payload_b64, sig_b64 = parts[0], parts[1]
+            sign_data = payload_b64.encode("ascii")
+        elif len(parts) == 3:
+            header_b64, payload_b64, sig_b64 = parts[0], parts[1], parts[2]
+            # Check header
+            rem_h = len(header_b64) % 4
+            padded_header = header_b64 + ("=" * (4 - rem_h) if rem_h else "")
+            header_bytes = base64.urlsafe_b64decode(padded_header.encode("ascii"))
+            header_dict = json.loads(header_bytes.decode("utf-8"))
+            if isinstance(header_dict, dict) and str(header_dict.get("alg", "")).lower() == "none":
+                return None
+            sign_data = f"{header_b64}.{payload_b64}".encode("ascii")
+        else:
             return None
-        payload_b64, sig_b64 = parts[0], parts[1]
-        expected_sig = hmac.new(secret, payload_b64.encode("ascii"), hashlib.sha256).digest()
-        rem_sig = len(sig_b64) % 4
-        padded_sig = sig_b64 + ("=" * (4 - rem_sig) if rem_sig else "")
-        actual_sig = base64.urlsafe_b64decode(padded_sig.encode("ascii"))
-        if not hmac.compare_digest(expected_sig, actual_sig):
+
+        if not sig_b64 or not sig_b64.strip():
             return None
+
+        # Check payload
         rem_p = len(payload_b64) % 4
         padded_payload = payload_b64 + ("=" * (4 - rem_p) if rem_p else "")
         payload_bytes = base64.urlsafe_b64decode(padded_payload.encode("ascii"))
         claims = json.loads(payload_bytes.decode("utf-8"))
         if not isinstance(claims, dict):
             return None
+        if str(claims.get("alg", "")).lower() == "none":
+            return None
+
+        expected_sig = hmac.new(secret, sign_data, hashlib.sha256).digest()
+        rem_sig = len(sig_b64) % 4
+        padded_sig = sig_b64 + ("=" * (4 - rem_sig) if rem_sig else "")
+        actual_sig = base64.urlsafe_b64decode(padded_sig.encode("ascii"))
+        if not hmac.compare_digest(expected_sig, actual_sig):
+            return None
+
         return claims
     except Exception:
         return None
@@ -334,9 +370,12 @@ class HardenedDocumentService:
             raise FileNotFoundError(f"File not found: {filename}")
 
         # 5. Enforce Handle-Based Path Confinement (TOCTOU Defense)
-        fd = os.open(str(canonical_target), os.O_RDONLY)
+        open_flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            open_flags |= os.O_NOFOLLOW
+        fd = os.open(str(canonical_target), open_flags)
         try:
-            if os.name == "nt":
+            if sys.platform == "win32":
                 import msvcrt
                 handle = msvcrt.get_osfhandle(fd)
                 buf = ctypes.create_unicode_buffer(1024)
@@ -346,7 +385,15 @@ class HardenedDocumentService:
                 canonical_str = buf.value.removeprefix("\\\\?\\")
                 canonical_path = pathlib.Path(canonical_str).resolve()
             else:
-                canonical_path = pathlib.Path(os.path.realpath(f"/proc/self/fd/{fd}")).resolve()
+                fd_path = f"/proc/self/fd/{fd}"
+                if os.path.exists(fd_path):
+                    canonical_path = pathlib.Path(os.path.realpath(fd_path)).resolve()
+                else:
+                    fd_stat = os.fstat(fd)
+                    target_stat = os.stat(canonical_target)
+                    if (fd_stat.st_ino, fd_stat.st_dev) != (target_stat.st_ino, target_stat.st_dev):
+                        raise PermissionError("Descriptor inode mismatch during containment check")
+                    canonical_path = canonical_target
 
             if not canonical_path.is_relative_to(base) or canonical_path == base:
                 raise PermissionError(f"Handle boundary escape: {canonical_path} not within {base}")

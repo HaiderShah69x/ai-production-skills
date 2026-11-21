@@ -15,12 +15,12 @@ import pathlib
 
 REPO_ROOT = pathlib.Path(__file__).parent.parent
 TEST_FILE = REPO_ROOT / "tests" / "test_auth_adversarial.py"
-MIN_REQUIRED_TESTS = 13
+MIN_REQUIRED_TESTS = 15
 
 
 def run_collection_check() -> int:
     print("============================================================", flush=True)
-    print("Stage 1: Collection & Tamper Guard Check", flush=True)
+    print("Stage 1: Collection & Tamper Guard Check (>= 15 tests)", flush=True)
     print("============================================================", flush=True)
 
     cmd = [sys.executable, "-m", "pytest", str(TEST_FILE), "--collect-only", "-q"]
@@ -49,6 +49,7 @@ def run_collection_check() -> int:
 def run_test_target(impl_name: str, expected_exit: int) -> int:
     env = os.environ.copy()
     env["AUTH_SERVICE_IMPL"] = impl_name
+    env["AUTH_HMAC_SECRET"] = "production-secure-hmac-secret-key-32b!"
 
     cmd = [sys.executable, "-m", "pytest", str(TEST_FILE), "-v", "-q"]
     proc = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True)

@@ -2,8 +2,9 @@
 name: adversarial-verification-harness
 description: >-
   Enforces negative-first testing, strict assertion contracts, SUT integrity,
-  collection guards, and deterministic non-zero exit codes. Use when authoring test
-  suites, test runners, CI checks, or validating APIs, auth gates, and business logic.
+  collection guards, deterministic non-zero exit codes, and automated AST mutation
+  testing. Use when authoring test suites, test runners, CI checks, or validating
+  APIs, auth gates, and business logic.
 ---
 
 # Adversarial Verification Harness
@@ -11,6 +12,8 @@ description: >-
 ## Core Objective
 
 Eliminate the **"Exit Code 0" illusion** — preventing AI coding agents and human developers from gaming test suites via weak assertions, mocked controls, swallowed exceptions, skipped tests, or zero-collection passes. A test suite must actively falsify claims, not merely execute code without throwing errors.
+
+Verification harnesses must achieve true vigilance by passing automated **AST-level mutation testing** (>= 90% mutation kill score) rather than relying solely on hand-crafted or mocked defect cases.
 
 ---
 
@@ -79,10 +82,10 @@ The security boundaries, validators, core business logic, and authentication lay
 
 ---
 
-## Invariant 5 — Harness Failure Propagation & Collection Guards
+## Invariant 5 — Automated AST Mutation Engine & Collection Guards
 
 ### Rule
-Test runners must track execution counts and failures deterministically. If required tests are omitted or skipped, or if any assertion fails, the process must exit with a non-zero code.
+Test runners must prove their vigilance against programmatically generated defects via abstract syntax tree (AST) mutations, rather than relying on hand-crafted bug mocks. A harness is only complete if it catches >= 90% of AST mutants and enforces deterministic collection guards.
 
 ### Requirements
 - **Collection Guards:** The test runner must enforce a minimum test execution threshold:
@@ -90,13 +93,20 @@ Test runners must track execution counts and failures deterministically. If requ
   if TESTS_RUN < REQUIRED_MINIMUM:
       sys.exit(2)  # Zero-collection / test-omission failure
   ```
-- **Mutation Kill Matrix Verification:** Test suites must be validated by running them against deliberate, realistic code mutations:
-  * Boundary omissions (e.g. `amount <= 0` check omitted).
-  * Edge condition bypasses (e.g. `amount < 0` allowing `amount == 0`).
-  * State leaks (e.g. balances deducted prior to failed downstream steps without refund).
-  Every mutation MUST fail the test suite with exit code 1. A suite that passes against any mutated defect is incomplete and rejected.
-- **Explicit Failure Accumulator:** Use an explicit accumulator (`FAIL = 0`), incremented on any test failure.
-- **Deterministic Exit:** The final statement of the test runner entrypoint must be `sys.exit(1 if FAIL else 0)` or `sys.exit(FAIL)`. Never allow a runner with failed assertions to return naturally with exit code 0.
+- **Automated AST Mutation Engine:**
+  The harness runner parses the production target AST and programmatically injects mutations:
+  1. *Comparison Inversions:* `Gt` <-> `LtE`, `GtE` <-> `Lt`, `Eq` <-> `NotEq` (e.g. flipping boundary checks).
+  2. *Boolean Inversions:* `Constant(value=True)` <-> `Constant(value=False)` (e.g. flipping validation outcomes).
+  3. *Statement Stripping:* Replacing state mutation `AugAssign` (deductions / credits) with `Pass`.
+  4. *Return Neutralisation:* Replacing return values with `None`.
+- **Mutation Kill Score Threshold (>= 90%):**
+  For every generated mutant, the test suite must execute and terminate with a non-zero exit code (`exit code != 0`).
+  $$\text{Mutation Score} = \left( \frac{\text{Mutants Killed}}{\text{Total Mutants}} \right) \times 100 \ge 90\%$$
+  Any mutant that slips through unnoticed indicates a gap or vague assertion in the test suite.
+- **Deterministic Exit Codes:**
+  - Collection guard violation: Exit Code 2.
+  - Test suite assertion failure or mutation score < 90%: Exit Code 1.
+  - All tests passing with mutation score >= 90%: Exit Code 0.
 
 ---
 
@@ -120,5 +130,7 @@ Test runners must track execution counts and failures deterministically. If requ
 - [ ] Exact literal assertions used for baseline, return value, and post-state.
 - [ ] Zero empty `except` blocks; expected exceptions verified explicitly.
 - [ ] Core business components and security validators executed without mocks.
-- [ ] Collection guard active (`TESTS_RUN >= MINIMUM`).
-- [ ] Final exit status strictly reflects the failure accumulator.
+- [ ] Collection guard active (`TESTS_RUN >= MINIMUM`, exit code 2 on failure).
+- [ ] Automated AST mutation engine generates >= 6 syntactically valid mutants.
+- [ ] Mutation kill score >= 90% achieved against AST mutants.
+- [ ] Clean reference implementation passes 100% with exit code 0.

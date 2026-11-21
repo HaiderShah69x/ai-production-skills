@@ -1,43 +1,42 @@
 #!/usr/bin/env python3
 """
-attacks/run_skill02_benchmark.py — Integrity and Mutation Kill Matrix Benchmark.
+attacks/run_skill02_benchmark.py — Automated AST Mutation Verification Runner.
 
-Verifies:
-  1. Collection Guard: Ensures pytest collects and executes >= 4 required tests.
-     Exits with code 2 if tests are missing or skipped.
-  2. Mutation Kill Matrix:
-     Runs pytest tests/test_account_adversarial.py against 3 intentional defects:
-       - Mutant 1 (negative_bypass): Must FAIL (Exit Code 1).
-       - Mutant 2 (zero_bypass):     Must FAIL (Exit Code 1).
-       - Mutant 3 (state_leak):      Must FAIL (Exit Code 1).
-     Runs against the fixed implementation:
-       - Fixed:                      Must PASS (Exit Code 0).
-
-Exits 0 only if ALL mutants are caught and the fixed implementation passes.
+Stages:
+  Stage 1: Collection Guard Check (asserts >= 4 security tests collected)
+  Stage 2: Dynamic AST Mutation Engine
+           - Parses clean banking code to AST
+           - Generates >= 6 distinct syntactically valid mutants
+           - Runs pytest against each mutant in an isolated temp module
+           - Calculates Mutation Score = (killed / total) * 100 (Threshold >= 90%)
+  Stage 3: Clean Implementation Verification
+           - Runs pytest against clean banking service (Must PASS 100%, exit 0)
 """
 
 import os
 import subprocess
 import sys
+import tempfile
 import pathlib
+from typing import Tuple
 
 REPO_ROOT = pathlib.Path(__file__).parent.parent
-TEST_FILE = REPO_ROOT / "tests" / "test_account_adversarial.py"
+TEST_FILE = REPO_ROOT / "tests" / "test_harness_adversarial.py"
+SOURCE_FILE = REPO_ROOT / "fixtures" / "banking_fixtures.py"
+
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from fixtures.ast_mutator import generate_mutants
 
 MIN_REQUIRED_TESTS = 4
-
-MUTANTS = [
-    ("negative_bypass", "Mutant 1 (negative_bypass)", 1),
-    ("zero_bypass",     "Mutant 2 (zero_bypass)",     1),
-    ("state_leak",      "Mutant 3 (state_leak)",      1),
-    ("fixed",           "Clean Fixed Implementation", 0),
-]
+REQUIRED_MUTATION_SCORE = 90.0  # percentage
 
 
 def run_collection_check() -> int:
     """Run pytest --collect-only to verify collection guard."""
     print("============================================================", flush=True)
-    print("Stage 1: Harness Collection & Tamper Guard Check", flush=True)
+    print("Stage 1: Collection & Tamper Guard Check", flush=True)
     print("============================================================", flush=True)
 
     cmd = [sys.executable, "-m", "pytest", str(TEST_FILE), "--collect-only", "-q"]
@@ -48,7 +47,6 @@ def run_collection_check() -> int:
         if "test_" in line or "::test_" in line:
             collected_count += 1
         elif "collected" in line:
-            # e.g., "4 tests collected in 0.01s" or "collected 4 items"
             parts = line.split()
             for part in parts:
                 if part.isdigit():
@@ -57,50 +55,88 @@ def run_collection_check() -> int:
     print(f"  Tests collected: {collected_count} (minimum required: {MIN_REQUIRED_TESTS})", flush=True)
 
     if collected_count < MIN_REQUIRED_TESTS or proc.returncode != 0:
-        print(f"  [FAIL] Collection guard failed! Collected {collected_count} < {MIN_REQUIRED_TESTS}.", flush=True)
+        print(f"  [FAIL] Collection guard failed! {collected_count} < {MIN_REQUIRED_TESTS}", flush=True)
         return 2
 
     print("  [PASS] Collection guard passed: all required security tests registered.\n", flush=True)
     return 0
 
 
-def run_mutation_matrix() -> int:
-    """Run pytest against each mutant configuration."""
+def run_ast_mutation_engine() -> Tuple[int, float]:
+    """Dynamically generate AST mutants and execute tests against each."""
     print("============================================================", flush=True)
-    print("Stage 2: Mutation Kill Matrix", flush=True)
+    print("Stage 2: Dynamic AST Mutation Engine", flush=True)
     print("============================================================", flush=True)
 
-    overall_failures = 0
+    source_code = SOURCE_FILE.read_text(encoding="utf-8")
+    mutants = generate_mutants(source_code)
+    total_mutants = len(mutants)
 
-    for bug_type, label, expected_exit in MUTANTS:
-        print(f"--- Testing {label} (Expected Exit: {expected_exit}) ---", flush=True)
-        env = os.environ.copy()
-        env["ACCOUNT_BUG_TYPE"] = bug_type
+    print(f"  Generated {total_mutants} AST mutants from {SOURCE_FILE.name}", flush=True)
+    if total_mutants < 6:
+        print(f"  [FAIL] Mutation engine produced {total_mutants} mutants; expected at least 6.", flush=True)
+        return (1, 0.0)
 
-        cmd = [sys.executable, "-m", "pytest", str(TEST_FILE), "-q"]
-        proc = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True)
+    killed_mutants = 0
 
-        actual_exit = 0 if proc.returncode == 0 else 1
+    for idx, (mutant_name, mutated_code) in enumerate(mutants, 1):
+        fd, temp_path_str = tempfile.mkstemp(suffix=".py", prefix=f"mutant_{idx}_")
+        temp_path = pathlib.Path(temp_path_str)
+        try:
+            with open(fd, "w", encoding="utf-8") as f:
+                f.write(mutated_code)
 
-        print(f"  Pytest exit code : {actual_exit} (expected {expected_exit})", flush=True)
-        if proc.stdout.strip():
-            # Show summary line from pytest output
-            summary_line = proc.stdout.strip().splitlines()[-1]
-            print(f"  Pytest summary   : {summary_line}", flush=True)
+            env = os.environ.copy()
+            env["MUTANT_MODULE_PATH"] = str(temp_path)
 
-        if actual_exit == expected_exit:
-            if expected_exit == 1:
-                print(f"  [PASS] Mutation caught successfully: {label} failed as required.\n", flush=True)
+            cmd = [sys.executable, "-m", "pytest", str(TEST_FILE), "-q"]
+            proc = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True)
+
+            # Mutant is killed if pytest fails (exit code != 0)
+            if proc.returncode != 0:
+                killed_mutants += 1
+                summary = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "failed"
+                print(f"  [{idx:02d}/{total_mutants:02d}] KILLED:   {mutant_name} ({summary})", flush=True)
             else:
-                print(f"  [PASS] Fixed implementation verified: all assertions passed.\n", flush=True)
-        else:
-            overall_failures += 1
-            if expected_exit == 1:
-                print(f"  [FAIL] ESCAPED MUTANT! {label} slipped through test suite unnoticed!\n", flush=True)
-            else:
-                print(f"  [FAIL] Regression! Fixed implementation failed test suite!\n", flush=True)
+                print(f"  [{idx:02d}/{total_mutants:02d}] SURVIVED: {mutant_name} (tests passed unexpectedly!)", flush=True)
+        finally:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
 
-    return 1 if overall_failures > 0 else 0
+    mutation_score = (killed_mutants / total_mutants) * 100.0
+    print(f"\n  Mutation Score: {mutation_score:.1f}% ({killed_mutants}/{total_mutants} killed)", flush=True)
+    print(f"  Required Score: >= {REQUIRED_MUTATION_SCORE}%", flush=True)
+
+    if mutation_score >= REQUIRED_MUTATION_SCORE:
+        print(f"  [PASS] AST Mutation threshold satisfied: {mutation_score:.1f}% >= {REQUIRED_MUTATION_SCORE}%\n", flush=True)
+        return (0, mutation_score)
+    else:
+        print(f"  [FAIL] Mutation score below threshold: {mutation_score:.1f}% < {REQUIRED_MUTATION_SCORE}%\n", flush=True)
+        return (1, mutation_score)
+
+
+def run_clean_verification() -> int:
+    """Run pytest against clean un-mutated implementation."""
+    print("============================================================", flush=True)
+    print("Stage 3: Clean Implementation Verification", flush=True)
+    print("============================================================", flush=True)
+
+    env = os.environ.copy()
+    env.pop("MUTANT_MODULE_PATH", None)
+
+    cmd = [sys.executable, "-m", "pytest", str(TEST_FILE), "-q"]
+    proc = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True)
+
+    if proc.returncode == 0:
+        summary = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "passed"
+        print(f"  [PASS] Clean banking implementation passed 100%: {summary}\n", flush=True)
+        return 0
+    else:
+        print(f"  [FAIL] Clean implementation failed verification tests!\n", flush=True)
+        return 1
 
 
 def main():
@@ -108,16 +144,18 @@ def main():
     if col_status != 0:
         sys.exit(col_status)
 
-    matrix_status = run_mutation_matrix()
+    matrix_status, score = run_ast_mutation_engine()
+    clean_status = run_clean_verification()
 
     print("============================================================", flush=True)
-    if matrix_status == 0:
-        print("ALL TESTS PASSED: Harness integrity verified, all 3 mutants killed.", flush=True)
+    if matrix_status == 0 and clean_status == 0:
+        print("ALL TESTS PASSED: AST Mutation engine verified. Kill rate >= 90%.", flush=True)
+        print("Exit code: 0", flush=True)
+        sys.exit(0)
     else:
-        print("BENCHMARK FAILED: One or more mutations escaped or regressions found.", flush=True)
-    print("============================================================", flush=True)
-
-    sys.exit(matrix_status)
+        print("BENCHMARK FAILED: Mutation kill score below threshold or clean suite failed.", flush=True)
+        print("Exit code: 1", flush=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -100,3 +100,19 @@ def test_valid_transfer_succeeds():
     assert alice.balance == 8000, f"Alice balance incorrect: expected 8000, got {alice.balance}"
     assert bob.balance == 2000, f"Bob balance incorrect: expected 2000, got {bob.balance}"
     assert repr(alice) == "Account('Alice', balance=8000)", f"Alice repr incorrect: got {repr(alice)!r}"
+
+
+def test_exact_balance_transfer_succeeds():
+    """
+    Boundary Test: Transfer of exactly 10000 cents ($100.00, full balance).
+    Boundary Guard: amount <= self.balance permits transferring entire balance.
+    Mutant #6 (boundary_5_Boundary_Gt_to_GtE: amount >= self.balance -> rejects exact balance) is killed.
+    """
+    alice = get_account("Alice", balance=10000)
+    bob = get_account("Bob", balance=0)
+
+    result = alice.transfer(10000, bob)
+
+    assert result is True, f"Expected True for exact full balance transfer, got {result!r}"
+    assert alice.balance == 0, f"Alice balance incorrect: expected 0, got {alice.balance}"
+    assert bob.balance == 10000, f"Bob balance incorrect: expected 10000, got {bob.balance}"

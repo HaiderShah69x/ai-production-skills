@@ -3,10 +3,10 @@
 attacks/run_skill02_benchmark.py — Automated AST Mutation Verification Runner.
 
 Stages:
-  Stage 1: Collection Guard Check (asserts >= 4 security tests collected)
+  Stage 1: Collection Guard Check (asserts >= 5 security tests collected)
   Stage 2: Dynamic AST Mutation Engine
            - Parses clean banking code to AST
-           - Generates >= 6 distinct syntactically valid mutants
+           - Generates >= 15 distinct syntactically valid mutants
            - Runs pytest against each mutant in an isolated temp module
            - Calculates Mutation Score = (killed / total) * 100 (Threshold >= 90%)
   Stage 3: Clean Implementation Verification
@@ -29,7 +29,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from fixtures.ast_mutator import generate_mutants
 
-MIN_REQUIRED_TESTS = 4
+MIN_REQUIRED_TESTS = 5
 REQUIRED_MUTATION_SCORE = 90.0  # percentage
 
 
@@ -73,8 +73,8 @@ def run_ast_mutation_engine() -> Tuple[int, float]:
     total_mutants = len(mutants)
 
     print(f"  Generated {total_mutants} AST mutants from {SOURCE_FILE.name}", flush=True)
-    if total_mutants < 6:
-        print(f"  [FAIL] Mutation engine produced {total_mutants} mutants; expected at least 6.", flush=True)
+    if total_mutants < 15:
+        print(f"  [FAIL] Mutation engine produced {total_mutants} mutants; expected at least 15.", flush=True)
         return (1, 0.0)
 
     killed_mutants = 0

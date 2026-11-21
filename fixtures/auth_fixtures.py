@@ -408,7 +408,8 @@ class AuthRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_PUT(self) -> None:
-        parts = [p for p in self.path.strip("/").split("/") if p]
+        path_only = self.path.split("?", 1)[0]
+        parts = [p for p in path_only.strip("/").split("/") if p]
         if len(parts) == 2 and parts[0] == "documents":
             doc_id = parts[1]
             try:

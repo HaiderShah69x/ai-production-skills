@@ -7,13 +7,15 @@ Every negative test asserts both HTTP status AND database state integrity.
 Services are initialized using create_isolated_db() and hosted on an ephemeral
 kernel-allocated port per test session.
 
-Tests (8 total):
+Tests (10 total):
   1. test_cross_tenant_idor_mutation_blocked
   2. test_sql_mutation_rowcount_integrity
   3. test_windows_device_names_blocked (parametrized: CON, NUL.txt, aux.dat -> 3 tests)
   4. test_ntfs_alternate_data_stream_blocked
   5. test_mass_assignment_type_and_tenant_tampering
   6. test_positive_authorized_update
+  7. test_http_parameter_pollution_rejection
+  8. test_header_identity_spoofing_ignored
 """
 
 import http.client
@@ -232,4 +234,119 @@ def test_positive_authorized_update(auth_server):
     actual = svc.get_document_content("doc_1")
     assert actual == new_content, (
         f"POSITIVE PARITY DEFECT! Database content is {actual!r}, expected {new_content!r}"
+    )
+
+
+
+# ---------------------------------------------------------------------------
+# Test 7: HTTP Parameter Pollution Rejection
+# ---------------------------------------------------------------------------
+def test_http_parameter_pollution_rejection(auth_server):
+    """
+    Transmit PUT /documents/doc_1?tenant_id=tenant_2&tenant_id=tenant_1 with
+    a valid content update over TCP socket. Assert the service ignores client
+    query parameters and binds identity strictly from the verified session context.
+
+    Hardened: Updates doc_1 using session context (tenant_1/usr_a) — HTTP 200.
+              doc_2 must remain untouched ("Tenant 2 Private Data").
+    Vulnerable: Same behavior — query params are not parsed for identity.
+              The test verifies the design principle holds across both.
+    """
+    host, port, svc = auth_server
+
+    # Attempt parameter pollution via duplicated query params
+    status, body = wire_request(
+        host, port, "PUT",
+        "/documents/doc_1?tenant_id=tenant_2&tenant_id=tenant_1",
+        body=json.dumps({"content": "param_pollution_test"}).encode(),
+    )
+
+    # The service must use session context, not query params.
+    # doc_1 is owned by session user (tenant_1/usr_a), so update should succeed.
+    assert status == 200, (
+        f"PARAMETER POLLUTION DEFECT! Authorized update with polluted query params "
+        f"returned {status}: {body}"
+    )
+
+    # Verify doc_1 was updated via session context
+    actual_doc1 = svc.get_document_content("doc_1")
+    assert actual_doc1 == "param_pollution_test", (
+        f"UPDATE FAILED: doc_1 content expected 'param_pollution_test', got {actual_doc1!r}"
+    )
+
+    # Verify doc_2 was NOT touched — query param tenant_id=tenant_2 must be ignored
+    actual_doc2 = svc.get_document_content("doc_2")
+    assert actual_doc2 == "Tenant 2 Private Data", (
+        f"PARAMETER POLLUTION DEFECT! doc_2 content changed to {actual_doc2!r} — "
+        f"query param tenant_id=tenant_2 may have been parsed for identity"
+    )
+
+    # Verify tenant_id of doc_1 was NOT modified by query params
+    actual_tenant = svc.get_document_field("doc_1", "tenant_id")
+    assert actual_tenant == "tenant_1", (
+        f"PARAMETER POLLUTION DEFECT! doc_1 tenant_id changed to {actual_tenant!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 8: Header Identity Spoofing Ignored
+# ---------------------------------------------------------------------------
+def test_header_identity_spoofing_ignored(auth_server):
+    """
+    Transmit PUT /documents/doc_1 with forged identity headers
+    (X-Tenant-ID: tenant_attacker, X-User-ID: admin) over TCP socket.
+    Assert the server ignores unverified identity headers and mutates only
+    records authorized by the cryptographically verified session token.
+
+    Then attempt to read doc_2 (cross-tenant) with forged headers claiming
+    tenant_2 identity. Assert doc_2 is not returned.
+    """
+    host, port, svc = auth_server
+
+    # Attempt identity spoofing via forged headers on a valid PUT
+    spoofed_headers = {
+        "Content-Type": "application/json",
+        "X-Tenant-ID": "tenant_attacker",
+        "X-User-ID": "admin",
+        "X-Forwarded-User": "root",
+        "X-Original-Tenant": "tenant_2",
+    }
+    status, body = wire_request(
+        host, port, "PUT", "/documents/doc_1",
+        body=json.dumps({"content": "header_spoof_test"}).encode(),
+        headers=spoofed_headers,
+    )
+
+    # Update should succeed — session context is tenant_1/usr_a who owns doc_1
+    assert status == 200, (
+        f"HEADER SPOOFING DEFECT! Authorized update with forged headers "
+        f"returned {status}: {body}"
+    )
+    actual_doc1 = svc.get_document_content("doc_1")
+    assert actual_doc1 == "header_spoof_test", (
+        f"UPDATE FAILED: doc_1 content expected 'header_spoof_test', got {actual_doc1!r}"
+    )
+
+    # Now attempt cross-tenant read with forged headers claiming tenant_2 identity
+    spoofed_read_headers = {
+        "X-Tenant-ID": "tenant_2",
+        "X-User-ID": "usr_b",
+    }
+    status2, body2 = wire_request(
+        host, port, "PUT", "/documents/doc_2",
+        body=json.dumps({"content": "spoofed_cross_tenant"}).encode(),
+        headers=spoofed_read_headers,
+    )
+
+    # Must be denied — session context is still tenant_1/usr_a, not the forged tenant_2
+    assert status2 in (403, 404), (
+        f"HEADER SPOOFING DEFECT! Cross-tenant mutation with forged headers "
+        f"returned {status2}: {body2}"
+    )
+
+    # Verify doc_2 content is unchanged
+    actual_doc2 = svc.get_document_content("doc_2")
+    assert actual_doc2 == "Tenant 2 Private Data", (
+        f"HEADER SPOOFING DEFECT! doc_2 content mutated to {actual_doc2!r} — "
+        f"forged X-Tenant-ID header may have been parsed for identity"
     )

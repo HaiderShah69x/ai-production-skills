@@ -3,9 +3,12 @@ fixtures/ast_mutator.py — Automated AST-level mutation engine for verification
 
 Implements programmatic defect injection directly on Python abstract syntax trees:
   - Comparison operator inversion (Gt <-> LtE, GtE <-> Lt, Eq <-> NotEq)
+  - Boundary comparison mutations (Lt <-> LtE, Gt <-> GtE — strict vs non-strict)
   - Boolean literal inversion (True <-> False)
+  - Off-by-one arithmetic mutations (Add <-> Sub, Mult <-> FloorDiv)
   - Statement stripping (balance deduction AugAssign -> Pass)
   - Return value neutralisation (Return(val) -> Return(None))
+  - Exception swallowing mutations (ExceptHandler body -> Pass)
 """
 
 import ast
@@ -27,6 +30,20 @@ class ASTMutator(ast.NodeTransformer):
         ast.NotEq: ast.Eq,
     }
 
+    BOUNDARY_MUTATIONS = {
+        ast.Lt: ast.LtE,
+        ast.LtE: ast.Lt,
+        ast.Gt: ast.GtE,
+        ast.GtE: ast.Gt,
+    }
+
+    ARITHMETIC_INVERSIONS = {
+        ast.Add: ast.Sub,
+        ast.Sub: ast.Add,
+        ast.Mult: ast.FloorDiv,
+        ast.FloorDiv: ast.Mult,
+    }
+
     def __init__(self, target_id: str | None = None) -> None:
         super().__init__()
         self.target_id = target_id
@@ -35,24 +52,31 @@ class ASTMutator(ast.NodeTransformer):
 
     def visit_Compare(self, node: ast.Compare) -> ast.AST:
         self.generic_visit(node)
-        new_ops = []
-        mutated = False
-        for op in node.ops:
+        new_ops = list(node.ops)
+        for i, op in enumerate(node.ops):
             op_type = type(op)
+
+            # Full inversion mutations (Gt <-> LtE, etc.)
             if op_type in self.COMPARE_INVERSIONS:
                 site_id = f"cmp_invert_{self.current_idx}"
-                desc = f"Invert_{op_type.__name__}_to_{self.COMPARE_INVERSIONS[op_type].__name__}"
+                inv_type = self.COMPARE_INVERSIONS[op_type]
+                desc = f"Invert_{op_type.__name__}_to_{inv_type.__name__}"
                 self.available_targets.append((site_id, desc))
                 if self.target_id == site_id:
-                    new_ops.append(self.COMPARE_INVERSIONS[op_type]())
-                    mutated = True
-                else:
-                    new_ops.append(op)
+                    new_ops[i] = inv_type()
                 self.current_idx += 1
-            else:
-                new_ops.append(op)
-        if mutated:
-            node.ops = new_ops
+
+            # Boundary mutations (strict <-> non-strict: Lt <-> LtE, Gt <-> GtE)
+            if op_type in self.BOUNDARY_MUTATIONS:
+                site_id = f"boundary_{self.current_idx}"
+                bnd_type = self.BOUNDARY_MUTATIONS[op_type]
+                desc = f"Boundary_{op_type.__name__}_to_{bnd_type.__name__}"
+                self.available_targets.append((site_id, desc))
+                if self.target_id == site_id:
+                    new_ops[i] = bnd_type()
+                self.current_idx += 1
+
+        node.ops = new_ops
         return node
 
     def visit_Constant(self, node: ast.Constant) -> ast.AST:
@@ -75,7 +99,33 @@ class ASTMutator(ast.NodeTransformer):
             ast.copy_location(pass_node, node)
             self.current_idx += 1
             return pass_node
-        self.current_idx += 1
+
+        # Arithmetic inversion on AugAssign op (e.g. -= becomes +=)
+        op_type = type(node.op)
+        if op_type in self.ARITHMETIC_INVERSIONS:
+            arith_id = f"arith_augassign_{self.current_idx}"
+            inv_type = self.ARITHMETIC_INVERSIONS[op_type]
+            desc = f"ArithInvert_{op_type.__name__}_to_{inv_type.__name__}"
+            self.available_targets.append((arith_id, desc))
+            if self.target_id == arith_id:
+                node.op = inv_type()
+            self.current_idx += 1
+        else:
+            self.current_idx += 1
+
+        return node
+
+    def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
+        self.generic_visit(node)
+        op_type = type(node.op)
+        if op_type in self.ARITHMETIC_INVERSIONS:
+            site_id = f"arith_binop_{self.current_idx}"
+            inv_type = self.ARITHMETIC_INVERSIONS[op_type]
+            desc = f"ArithInvert_{op_type.__name__}_to_{inv_type.__name__}"
+            self.available_targets.append((site_id, desc))
+            if self.target_id == site_id:
+                node.op = inv_type()
+            self.current_idx += 1
         return node
 
     def visit_Return(self, node: ast.Return) -> ast.AST:
@@ -89,12 +139,25 @@ class ASTMutator(ast.NodeTransformer):
             self.current_idx += 1
         return node
 
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> ast.AST:
+        self.generic_visit(node)
+        if node.body and not (len(node.body) == 1 and isinstance(node.body[0], ast.Pass)):
+            site_id = f"swallow_except_{self.current_idx}"
+            desc = "Swallow_ExceptHandler_body_to_Pass"
+            self.available_targets.append((site_id, desc))
+            if self.target_id == site_id:
+                pass_node = ast.Pass()
+                ast.copy_location(pass_node, node.body[0])
+                node.body = [pass_node]
+            self.current_idx += 1
+        return node
+
 
 def generate_mutants(source_code: str) -> List[Tuple[str, str]]:
     """
     Parses source code to AST, discovers all mutation sites,
     and returns a list of (mutant_name, mutated_source_code).
-    Guarantees at least 6 distinct, syntactically valid mutants.
+    Guarantees at least 15 distinct, syntactically valid mutants.
     """
     tree = ast.parse(source_code)
 

@@ -29,6 +29,8 @@ allowlists — verified against physical SQLite state, not in-memory mocks.
 
 ### Requirements
 - **Trusted Context Only (Forgery Prevention):** The `tenant_id` and `user_id` bound into SQL queries **MUST** originate from the verified session/token context (e.g. `service.session_tenant_id`). It is **strictly forbidden** to read these values from client query strings, JSON request bodies, form fields, or unverified headers.
+- **HTTP Parameter Pollution (HPP) Defense:** Route dispatchers and request handlers must strip query strings from path routing (e.g. `path.split("?", 1)[0]`). Multi-value query keys or conflicting parameters (`?tenant_id=tenant_2&tenant_id=tenant_1`) must never override verified session identity or leak data across tenant boundaries.
+- **Header Identity Spoofing Defense:** Untrusted ingress headers (such as `X-Tenant-ID`, `X-User-ID`, `X-Forwarded-User`, or `X-Original-Tenant`) must be completely ignored for identity resolution unless injected by a verified, authenticated internal API gateway. Tenancy scoping must derive solely from verified cryptographic session state.
 - **Compound SQL Scoping:** Every mutation must enforce compound ownership at the database level:
   ```sql
   UPDATE documents SET content = ?
@@ -96,6 +98,8 @@ Synthetic dispatch mocks are eliminated. Every negative test asserts both HTTP s
 4. **NTFS Alternate Data Stream:** Request `file.txt:stream` over TCP. Assert immediate rejection (HTTP 400/403).
 5. **Mass-Assignment Tampering:** PUT `/documents/doc_1` with `{"content": "valid", "tenant_id": "tenant_2", "role": ["admin"]}`. Assert content updates while `tenant_id` remains `"tenant_1"` in SQLite.
 6. **Positive Parity:** User A updates own `doc_1` with valid payload over TCP. Assert HTTP 200 and database reflects new content.
+7. **HTTP Parameter Pollution Rejection:** Issue `PUT /documents/doc_1?tenant_id=tenant_2&tenant_id=tenant_1` over TCP. Assert service ignores ambiguous query parameters and binds strictly to verified session identity without cross-tenant modification.
+8. **Header Identity Spoofing Ignored:** Issue PUT requests with forged identity headers (`X-Tenant-ID: tenant_attacker`, `X-User-ID: admin`). Assert server ignores spoofed headers and strictly denies cross-tenant access.
 
 ---
 
@@ -104,6 +108,8 @@ Synthetic dispatch mocks are eliminated. Every negative test asserts both HTTP s
 - [ ] Every SQL mutation includes compound `WHERE tenant_id = ? AND owner_id = ?`.
 - [ ] `cursor.rowcount` verified after every UPDATE; rollback on mismatch.
 - [ ] Identity context bound from verified session, never from client input.
+- [ ] HTTP Parameter Pollution blocked; query strings stripped from routes and ignored for auth.
+- [ ] Ingress identity headers (`X-Tenant-ID`, `X-User-ID`) ignored in favor of verified session context.
 - [ ] File paths reject `:` before resolution (NTFS ADS block).
 - [ ] Windows reserved device names rejected case-insensitively.
 - [ ] Trailing dots/spaces stripped from path components.
@@ -111,4 +117,4 @@ Synthetic dispatch mocks are eliminated. Every negative test asserts both HTTP s
 - [ ] Handle-based path confinement verifies opened file descriptor via device handle before reading.
 - [ ] Schema allowlist active — `tenant_id`, `owner_id`, `id`, `role` unwritable.
 - [ ] Live ephemeral loopback TCP sockets tested with `http.client.HTTPConnection`.
-- [ ] All 8 adversarial tests pass against hardened, fail against vulnerable.
+- [ ] All 10 adversarial tests pass against hardened, fail against vulnerable.

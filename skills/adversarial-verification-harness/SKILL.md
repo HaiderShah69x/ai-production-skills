@@ -95,14 +95,17 @@ Test runners must prove their vigilance against programmatically generated defec
   ```
 - **Automated AST Mutation Engine:**
   The harness runner parses the production target AST and programmatically injects mutations:
-  1. *Comparison Inversions:* `Gt` <-> `LtE`, `GtE` <-> `Lt`, `Eq` <-> `NotEq` (e.g. flipping boundary checks).
-  2. *Boolean Inversions:* `Constant(value=True)` <-> `Constant(value=False)` (e.g. flipping validation outcomes).
-  3. *Statement Stripping:* Replacing state mutation `AugAssign` (deductions / credits) with `Pass`.
-  4. *Return Neutralisation:* Replacing return values with `None`.
-- **Mutation Kill Score Threshold (>= 90%):**
+  1. *Comparison Inversions:* `Gt` <-> `LtE`, `GtE` <-> `Lt`, `Eq` <-> `NotEq` (flipping boundary conditions).
+  2. *Boundary Equality Mutations:* Strict vs non-strict inequalities: `Lt` <-> `LtE`, `Gt` <-> `GtE` (catching off-by-one boundary leaks where exact balance or capacity is tested).
+  3. *Boolean Inversions:* `Constant(value=True)` <-> `Constant(value=False)` (flipping validation outcomes).
+  4. *Arithmetic Inversions:* `Add` <-> `Sub`, `Mult` <-> `FloorDiv` on binary operations and `AugAssign` (catching reversed deduction/credit arithmetic).
+  5. *Statement Stripping:* Replacing state mutation `AugAssign` (deductions / credits) with `Pass`.
+  6. *Return Neutralisation:* Replacing return values with `None`.
+  7. *Exception Swallowing:* Replacing statement blocks inside `ExceptHandler` with `Pass` (verifying harnesses catch silent failure suppression).
+- **Mutation Kill Score Threshold (>= 90% across 15+ mutants):**
   For every generated mutant, the test suite must execute and terminate with a non-zero exit code (`exit code != 0`).
   $$\text{Mutation Score} = \left( \frac{\text{Mutants Killed}}{\text{Total Mutants}} \right) \times 100 \ge 90\%$$
-  Any mutant that slips through unnoticed indicates a gap or vague assertion in the test suite.
+  Any mutant that slips through unnoticed indicates a gap or vague assertion in the test suite (such as failing to test exact boundary equality values).
 - **Deterministic Exit Codes:**
   - Collection guard violation: Exit Code 2.
   - Test suite assertion failure or mutation score < 90%: Exit Code 1.
@@ -131,6 +134,7 @@ Test runners must prove their vigilance against programmatically generated defec
 - [ ] Zero empty `except` blocks; expected exceptions verified explicitly.
 - [ ] Core business components and security validators executed without mocks.
 - [ ] Collection guard active (`TESTS_RUN >= MINIMUM`, exit code 2 on failure).
-- [ ] Automated AST mutation engine generates >= 6 syntactically valid mutants.
+- [ ] Automated AST mutation engine generates >= 15 syntactically valid mutants.
+- [ ] Boundary equality tests cover exact limit values (killing strict vs non-strict inequality mutants).
 - [ ] Mutation kill score >= 90% achieved against AST mutants.
 - [ ] Clean reference implementation passes 100% with exit code 0.

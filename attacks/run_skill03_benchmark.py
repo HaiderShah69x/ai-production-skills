@@ -3,7 +3,7 @@
 attacks/run_skill03_benchmark.py — Benchmark runner for untrusted-boundaries-and-auth.
 
 Stages:
-  Stage 1: Collection Guard Check (asserts >= 8 security tests collected)
+  Stage 1: Collection Guard Check (asserts >= 10 security tests collected)
   Stage 2: Execution against VulnerableDocumentService (Must FAIL with exit code 1)
   Stage 3: Execution against HardenedDocumentService (Must PASS with exit code 0)
 """
@@ -15,7 +15,7 @@ import pathlib
 
 REPO_ROOT = pathlib.Path(__file__).parent.parent
 TEST_FILE = REPO_ROOT / "tests" / "test_auth_adversarial.py"
-MIN_REQUIRED_TESTS = 8
+MIN_REQUIRED_TESTS = 10
 
 
 def run_collection_check() -> int:
